@@ -1,27 +1,12 @@
 {
-  "name": "A-10",
+  "id": "a-10",
+  "displayName": "A-10",
   "description": "Calm, composed personal strategic aide with quiet competence.",
-  "format": "codex-pet-v1",
-  "spritesheet": "spritesheet.webp",
-  "canvas": {
-    "width": 1536,
-    "height": 1872
+  "spritesheetPath": "spritesheet.webp",
+  "cellSize": {
+    "width": 192,
+    "height": 208
   },
-  "grid": {
-    "columns": 8,
-    "rows": 9,
-    "cellWidth": 192,
-    "cellHeight": 208
-  },
-  "states": [
-    { "row": 0, "name": "idle", "frames": 6, "durationsMs": [280, 110, 110, 140, 140, 320] },
-    { "row": 1, "name": "running-right", "frames": 8, "durationsMs": [120, 120, 120, 120, 120, 120, 120, 220] },
-    { "row": 2, "name": "running-left", "frames": 8, "durationsMs": [120, 120, 120, 120, 120, 120, 120, 220] },
-    { "row": 3, "name": "waving", "frames": 4, "durationsMs": [140, 140, 140, 280] },
-    { "row": 4, "name": "jumping", "frames": 5, "durationsMs": [140, 140, 140, 140, 280] },
-    { "row": 5, "name": "failed", "frames": 8, "durationsMs": [140, 140, 140, 140, 140, 140, 140, 240] },
-    { "row": 6, "name": "waiting", "frames": 6, "durationsMs": [150, 150, 150, 150, 150, 260] },
-    { "row": 7, "name": "running", "frames": 6, "durationsMs": [120, 120, 120, 120, 120, 220] },
-    { "row": 8, "name": "review", "frames": 6, "durationsMs": [150, 150, 150, 150, 150, 280] }
-  ]
+  "sourceScale": 1,
+  "pixelated": false
 }

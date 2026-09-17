@@ -1,6 +1,7 @@
 export const ATLAS_COLUMNS = 8;
 export const ATLAS_ROWS = 9;
 export const BASE_CELL = { width: 192, height: 208 };
+export const DEFAULT_PET_ID = "a-10";
 
 export type PetState =
   | "idle"

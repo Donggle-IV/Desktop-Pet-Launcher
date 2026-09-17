@@ -958,7 +958,7 @@ fn round_to_i32(value: f64) -> i32 {
 fn path_identity_key(path: &Path) -> String {
     #[cfg(windows)]
     {
-        return path.to_string_lossy().to_lowercase();
+        path.to_string_lossy().to_lowercase()
     }
 
     #[cfg(not(windows))]
@@ -1148,7 +1148,9 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn default_pet_roots(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
-    let mut roots = Vec::new();
+    // Keep the production resource as a normal package root so the existing
+    // discovery and validation pipeline handles built-in and imported pets alike.
+    let mut roots = vec![built_in_pet_root(app)?];
     if let Some(home) = home_dir() {
         roots.push(home.join(".codex").join("pets"));
     }
@@ -1159,6 +1161,34 @@ fn default_pet_roots(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
             .join("pets"),
     );
     Ok(roots)
+}
+
+fn built_in_pet_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let bundled = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?
+        .join("pets")
+        .join("a-10");
+
+    if bundled.is_dir() {
+        return Ok(bundled);
+    }
+
+    // `tauri dev` runs from the source checkout instead of an installed bundle.
+    // CARGO_MANIFEST_DIR is resolved from this portable source tree at build time.
+    #[cfg(debug_assertions)]
+    {
+        let development = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("resource")
+            .join("A-10-Codex-Pet-V1");
+        if development.is_dir() {
+            return Ok(development);
+        }
+    }
+
+    Ok(bundled)
 }
 
 fn expand_user_path(value: &str) -> Option<PathBuf> {

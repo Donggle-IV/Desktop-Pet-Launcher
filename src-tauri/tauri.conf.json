@@ -51,6 +51,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../resource/A-10-Codex-Pet-V1": "pets/a-10"
+    },
     "icon": [
       "icons/icon.ico",
       "icons/icon.png"

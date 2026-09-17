@@ -12,6 +12,7 @@ import { Loader2, MessageCircle, Send, Settings, Sparkles, X } from "lucide-reac
 import {
   ATLAS_COLUMNS,
   ATLAS_ROWS,
+  DEFAULT_PET_ID,
   STATE_DEFINITIONS,
   pickSpriteSource,
   type PetPackage,
@@ -106,7 +107,7 @@ export function PetWindow() {
       if (cancelled) {
         return;
       }
-      const activePetId = loadedSettings.activePetId ?? foundPackages[0]?.id ?? null;
+      const activePetId = selectActivePetId(loadedSettings.activePetId, foundPackages);
       const nextSettings = { ...loadedSettings, autostart, activePetId };
       setSettings(nextSettings);
       if (
@@ -186,7 +187,11 @@ export function PetWindow() {
   }, [refreshPackages]);
 
   const activePet = useMemo(() => {
-    return packages.find((candidate) => candidate.id === settings.activePetId) ?? packages[0];
+    return (
+      packages.find((candidate) => candidate.id === settings.activePetId) ??
+      packages.find((candidate) => candidate.id === DEFAULT_PET_ID) ??
+      packages[0]
+    );
   }, [packages, settings.activePetId]);
 
   const chatExpanded = settings.llmChatEnabled && chatOpen;
@@ -868,6 +873,14 @@ function hasPositionChanged(
   position: { x: number; y: number },
 ): boolean {
   return Math.round(settings.x ?? Number.NaN) !== position.x || Math.round(settings.y ?? Number.NaN) !== position.y;
+}
+
+function selectActivePetId(savedId: string | null, packages: PetPackage[]): string | null {
+  if (savedId && packages.some((candidate) => candidate.id === savedId)) {
+    return savedId;
+  }
+
+  return packages.find((candidate) => candidate.id === DEFAULT_PET_ID)?.id ?? packages[0]?.id ?? null;
 }
 
 function getSpriteFrameTransform(
