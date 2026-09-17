@@ -24,7 +24,13 @@ import {
   Trash2,
   ZoomIn,
 } from "lucide-react";
-import { BASE_CELL, PET_STATES, type PetPackage, type PetState } from "../lib/petContract";
+import {
+  BASE_CELL,
+  PET_STATES,
+  resolveActivePetId,
+  type PetPackage,
+  type PetState,
+} from "../lib/petContract";
 import {
   DEFAULT_GALLERY_INDEX_URL,
   DEFAULT_SETTINGS,
@@ -100,7 +106,7 @@ export function SettingsWindow() {
   const [newPetFolder, setNewPetFolder] = useState("");
 
   const activePet = useMemo(
-    () => packages.find((candidate) => candidate.id === settings.activePetId) ?? packages[0],
+    () => packages.find((candidate) => candidate.id === resolveActivePetId(settings.activePetId, packages)),
     [packages, settings.activePetId],
   );
   const scalePercent = Math.round((settings.width / BASE_CELL.width) * 100);
@@ -136,7 +142,7 @@ export function SettingsWindow() {
       const nextSettings = {
         ...loadedSettings,
         autostart,
-        activePetId: loadedSettings.activePetId ?? foundPackages[0]?.id ?? null,
+        activePetId: resolveActivePetId(loadedSettings.activePetId, foundPackages),
       };
       setSettings(nextSettings);
       if (
@@ -209,7 +215,7 @@ export function SettingsWindow() {
 
   async function refresh() {
     const found = await refreshPackages(settings.petFolders);
-    const activePetId = settings.activePetId ?? found[0]?.id ?? null;
+    const activePetId = resolveActivePetId(settings.activePetId, found);
     await commit({ ...settings, activePetId }, "펫 목록을 새로고침했습니다");
   }
 
@@ -255,9 +261,7 @@ export function SettingsWindow() {
         return;
       }
       const found = await refreshPackages(settings.petFolders);
-      const activePetId = found.some((candidate) => candidate.id === imported.id)
-        ? imported.id
-        : settings.activePetId;
+      const activePetId = resolveActivePetId(imported.id, found);
       await commit({ ...settings, activePetId }, `${imported.displayName}을(를) 가져왔습니다`);
     } catch (error) {
       console.error("Failed to import gallery pet", error);
@@ -274,10 +278,7 @@ export function SettingsWindow() {
 
     const petFolders = Array.from(new Set([...settings.petFolders, trimmed]));
     const found = await refreshPackages(petFolders);
-    const activePetId =
-      settings.activePetId && found.some((pet) => pet.id === settings.activePetId)
-        ? settings.activePetId
-        : found[0]?.id ?? null;
+    const activePetId = resolveActivePetId(settings.activePetId, found);
     await commit({ ...settings, petFolders, activePetId }, "펫 폴더를 추가했습니다");
     setNewPetFolder("");
   }
@@ -292,10 +293,7 @@ export function SettingsWindow() {
   async function removePetFolder(folder: string) {
     const petFolders = settings.petFolders.filter((candidate) => candidate !== folder);
     const found = await refreshPackages(petFolders);
-    const activePetId =
-      settings.activePetId && found.some((pet) => pet.id === settings.activePetId)
-        ? settings.activePetId
-        : found[0]?.id ?? null;
+    const activePetId = resolveActivePetId(settings.activePetId, found);
     await commit({ ...settings, petFolders, activePetId }, "펫 폴더를 제거했습니다");
   }
 

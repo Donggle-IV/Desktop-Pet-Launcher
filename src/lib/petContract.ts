@@ -40,6 +40,17 @@ export interface PetPackage {
   pixelated: boolean;
 }
 
+export function resolveActivePetId(
+  savedId: string | null,
+  packages: readonly Pick<PetPackage, "id">[],
+): string | null {
+  if (savedId && packages.some((candidate) => candidate.id === savedId)) {
+    return savedId;
+  }
+
+  return packages.find((candidate) => candidate.id === DEFAULT_PET_ID)?.id ?? packages[0]?.id ?? null;
+}
+
 export interface StateDefinition {
   row: number;
   frames: number;
