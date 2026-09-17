@@ -58,10 +58,10 @@ export class ErrorBoundary extends Component<Props, State> {
         }}
       >
         <strong style={{ display: "block", marginBottom: 8 }}>
-          {this.props.fallbackTitle ?? "桌宠界面出错"}
+          {this.props.fallbackTitle ?? "데스크톱 펫 화면 오류"}
         </strong>
         <p style={{ margin: "0 0 12px", opacity: 0.85, wordBreak: "break-word" }}>
-          {this.state.message || "发生了未捕获的渲染错误。"}
+          {this.state.message || "처리되지 않은 화면 렌더링 오류가 발생했습니다."}
         </p>
         <button
           type="button"
@@ -75,7 +75,7 @@ export class ErrorBoundary extends Component<Props, State> {
             cursor: "pointer",
           }}
         >
-          重新加载
+          다시 불러오기
         </button>
       </div>
     );

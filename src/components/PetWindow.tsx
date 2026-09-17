@@ -765,7 +765,7 @@ export function PetWindow() {
             className="empty-pet"
             onClick={() => showSettingsWindow()}
             onContextMenu={(event) => event.preventDefault()}
-            aria-label="打开设置"
+            aria-label="설정 열기"
           >
             <Sparkles size={28} />
             <Settings size={18} />
@@ -776,8 +776,8 @@ export function PetWindow() {
           <button
             className={`pet-chat-toggle ${chatOpen ? "is-open" : ""}`}
             type="button"
-            aria-label={chatOpen ? "关闭对话" : "打开对话"}
-            title={chatOpen ? "关闭对话" : "打开对话"}
+            aria-label={chatOpen ? "대화 닫기" : "대화 열기"}
+            title={chatOpen ? "대화 닫기" : "대화 열기"}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={(event) => {
               event.stopPropagation();
@@ -797,12 +797,12 @@ export function PetWindow() {
         <section
           className="pet-chat-bubble"
           style={{ width: chatPanelWidth }}
-          aria-label="桌宠对话"
+          aria-label="데스크톱 펫 대화"
           onDoubleClick={(event) => event.stopPropagation()}
         >
           <header className="pet-chat-header">
-            <span>{activePet?.displayName ?? "桌宠"} 正在听</span>
-            <button type="button" onClick={() => closeChat()} aria-label="关闭对话">
+            <span>{activePet?.displayName ?? "데스크톱 펫"}이(가) 듣고 있습니다</span>
+            <button type="button" onClick={() => closeChat()} aria-label="대화 닫기">
               <X size={15} />
             </button>
           </header>
@@ -825,7 +825,7 @@ export function PetWindow() {
               ))
             )}
             {chatPhase === "thinking" ? (
-              <div className="pet-chat-message is-assistant">思考中...</div>
+              <div className="pet-chat-message is-assistant">생각 중...</div>
             ) : null}
             {chatError ? <div className="pet-chat-error">{chatError}</div> : null}
           </div>

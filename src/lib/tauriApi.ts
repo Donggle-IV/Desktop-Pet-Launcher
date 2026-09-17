@@ -488,7 +488,7 @@ export async function sendLlmChat(request: LlmChatRequest): Promise<LlmChatRespo
     await new Promise((resolve) => window.setTimeout(resolve, 520));
     return {
       content:
-        "这是预览环境的模拟回复。打包运行后，我会使用你在设置里配置的接口地址和模型来对话。",
+        "미리보기 환경의 예시 응답입니다. 패키지로 실행하면 설정한 API 주소와 모델로 대화합니다.",
     };
   }
 

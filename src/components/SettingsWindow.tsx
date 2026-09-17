@@ -94,9 +94,9 @@ export function SettingsWindow() {
     currentVersion: "",
     latestVersion: "",
     releaseUrl: APP_LATEST_RELEASE_URL,
-    message: "尚未检查更新",
+    message: "업데이트를 아직 확인하지 않았습니다.",
   });
-  const [status, setStatus] = useState("已就绪");
+  const [status, setStatus] = useState("준비됨");
   const [newPetFolder, setNewPetFolder] = useState("");
 
   const activePet = useMemo(
@@ -157,7 +157,7 @@ export function SettingsWindow() {
 
   async function commit(
     next: AppSettings,
-    message = "已保存",
+    message = "저장했습니다",
     patch?: Partial<AppSettings>,
   ) {
     setSettings(next);
@@ -172,7 +172,7 @@ export function SettingsWindow() {
   async function update<K extends keyof AppSettings>(
     key: K,
     value: AppSettings[K],
-    message = "已保存",
+    message = "저장했습니다",
   ) {
     const next = { ...settings, [key]: value };
     const patchKeys: Array<keyof AppSettings> = [
@@ -190,17 +190,17 @@ export function SettingsWindow() {
     const width = Math.round((BASE_CELL.width * percent) / 100);
     const height = Math.round((BASE_CELL.height * percent) / 100);
     const next = { ...settings, width, height };
-    await commit(next, `缩放 ${percent}%`, { width, height });
+    await commit(next, `크기를 ${percent}%로 변경했습니다`, { width, height });
   }
 
   async function setSize(width: number, height: number) {
     const next = { ...settings, width, height };
-    await commit(next, "尺寸已更新", { width, height });
+    await commit(next, "크기를 변경했습니다", { width, height });
   }
 
   async function setPosition(x: number, y: number) {
     const next = { ...settings, x, y, positionCoordinateSpace: "logical" as const };
-    await commit(next, "位置已更新", { x, y });
+    await commit(next, "위치를 변경했습니다", { x, y });
   }
 
   async function resetPosition() {
@@ -210,20 +210,20 @@ export function SettingsWindow() {
   async function refresh() {
     const found = await refreshPackages(settings.petFolders);
     const activePetId = settings.activePetId ?? found[0]?.id ?? null;
-    await commit({ ...settings, activePetId }, "宠物列表已刷新");
+    await commit({ ...settings, activePetId }, "펫 목록을 새로고침했습니다");
   }
 
   async function loadGallery(indexUrl = galleryUrlDraft, persist = true) {
     const trimmed = indexUrl.trim();
     if (!trimmed) {
-      setStatus("请输入图鉴索引地址");
+      setStatus("갤러리 색인 주소를 입력하세요");
       return;
     }
 
     setGalleryLoading(true);
     try {
       if (persist && trimmed !== settings.galleryIndexUrl) {
-        await commit({ ...settings, galleryIndexUrl: trimmed }, "图鉴地址已保存");
+        await commit({ ...settings, galleryIndexUrl: trimmed }, "갤러리 주소를 저장했습니다");
       }
       const response = await fetch(trimmed, { cache: "no-store" });
       if (!response.ok) {
@@ -231,10 +231,10 @@ export function SettingsWindow() {
       }
       const index = (await response.json()) as GalleryIndex;
       setGalleryPets(Array.isArray(index.pets) ? index.pets : []);
-      setStatus(`图鉴已读取：${index.pets?.length ?? 0} 个桌宠`);
+      setStatus(`갤러리를 불러왔습니다: 펫 ${index.pets?.length ?? 0}개`);
     } catch (error) {
       console.error("Failed to load gallery", error);
-      setStatus("图鉴读取失败，请检查索引地址或网络");
+      setStatus("갤러리를 불러오지 못했습니다. 주소 또는 네트워크를 확인하세요.");
     } finally {
       setGalleryLoading(false);
     }
@@ -243,32 +243,32 @@ export function SettingsWindow() {
   async function importGalleryPet(pet: GalleryPet) {
     const downloadUrl = resolveGalleryUrl(pet.download, settings.galleryIndexUrl);
     if (!downloadUrl) {
-      setStatus("这个桌宠没有下载地址");
+      setStatus("이 펫에는 다운로드 주소가 없습니다");
       return;
     }
 
     try {
-      setStatus(`正在导入 ${pet.displayName ?? pet.name}`);
+      setStatus(`${pet.displayName ?? pet.name} 가져오는 중`);
       const imported = await importPetFromUrl(downloadUrl);
       if (!imported) {
-        setStatus("当前预览环境不支持导入");
+        setStatus("현재 미리보기 환경에서는 가져오기를 지원하지 않습니다");
         return;
       }
       const found = await refreshPackages(settings.petFolders);
       const activePetId = found.some((candidate) => candidate.id === imported.id)
         ? imported.id
         : settings.activePetId;
-      await commit({ ...settings, activePetId }, `${imported.displayName} 已导入`);
+      await commit({ ...settings, activePetId }, `${imported.displayName}을(를) 가져왔습니다`);
     } catch (error) {
       console.error("Failed to import gallery pet", error);
-      setStatus("导入失败，请确认下载链接是 zip 宠物包");
+      setStatus("가져오기에 실패했습니다. 다운로드 링크가 ZIP 펫 패키지인지 확인하세요.");
     }
   }
 
   async function addPetFolder(folder = newPetFolder) {
     const trimmed = folder.trim();
     if (!trimmed) {
-      setStatus("请输入宠物文件夹路径");
+      setStatus("펫 폴더 경로를 입력하세요");
       return;
     }
 
@@ -278,7 +278,7 @@ export function SettingsWindow() {
       settings.activePetId && found.some((pet) => pet.id === settings.activePetId)
         ? settings.activePetId
         : found[0]?.id ?? null;
-    await commit({ ...settings, petFolders, activePetId }, "宠物文件夹已添加");
+    await commit({ ...settings, petFolders, activePetId }, "펫 폴더를 추가했습니다");
     setNewPetFolder("");
   }
 
@@ -296,7 +296,7 @@ export function SettingsWindow() {
       settings.activePetId && found.some((pet) => pet.id === settings.activePetId)
         ? settings.activePetId
         : found[0]?.id ?? null;
-    await commit({ ...settings, petFolders, activePetId }, "宠物文件夹已移除");
+    await commit({ ...settings, petFolders, activePetId }, "펫 폴더를 제거했습니다");
   }
 
   async function toggleAutostart(enabled: boolean) {
@@ -304,18 +304,18 @@ export function SettingsWindow() {
       await writeAutostart(enabled);
       await commit(
         { ...settings, autostart: enabled },
-        enabled ? "开机自启已开启" : "开机自启已关闭",
+        enabled ? "시작 프로그램을 켰습니다" : "시작 프로그램을 껐습니다",
       );
     } catch (error) {
       console.error("Failed to update autostart", error);
-      setStatus("开机自启更新失败，请确认已安装最新版");
+      setStatus("시작 프로그램 설정에 실패했습니다. 최신 버전 설치 여부를 확인하세요.");
     }
   }
 
   async function toggleDragging(enabled: boolean) {
     await commit(
       { ...settings, dragEnabled: enabled, locked: !enabled },
-      enabled ? "已允许拖动桌宠" : "已固定当前位置",
+      enabled ? "펫 드래그를 허용했습니다" : "현재 위치를 고정했습니다",
     );
   }
 
@@ -323,7 +323,7 @@ export function SettingsWindow() {
     setUpdateCheck((current) => ({
       ...current,
       status: "checking",
-      message: "正在检查更新...",
+      message: "업데이트 확인 중...",
     }));
 
     try {
@@ -331,17 +331,17 @@ export function SettingsWindow() {
       const next = createUpdateCheckState(result);
       setUpdateCheck(next);
       if (manual) {
-        setStatus(next.status === "available" ? `发现新版本 ${next.latestVersion}` : "当前已是最新版本");
+        setStatus(next.status === "available" ? `새 버전 ${next.latestVersion}을 찾았습니다` : "최신 버전입니다");
       }
     } catch (error) {
       console.error("Failed to check updates", error);
       setUpdateCheck((current) => ({
         ...current,
         status: "error",
-        message: "自动检查没有拿到版本号，可以直接打开发布页查看最新版。",
+        message: "자동 업데이트 확인에서 버전 정보를 받지 못했습니다. 배포 페이지에서 최신 버전을 확인하세요.",
       }));
       if (manual) {
-        setStatus("更新检查失败，请检查网络");
+        setStatus("업데이트 확인에 실패했습니다. 네트워크를 확인하세요.");
       }
     }
   }
@@ -352,7 +352,7 @@ export function SettingsWindow() {
 
   return (
     <main className="settings-shell">
-      <aside className="settings-rail" aria-label="设置导航">
+      <aside className="settings-rail" aria-label="설정 탐색">
         <div className="brand-mark">
           <PawPrint size={24} />
         </div>
@@ -360,7 +360,7 @@ export function SettingsWindow() {
           className="rail-button is-active"
           type="button"
           onClick={() => scrollToPanel("pet-section")}
-          title="宠物"
+          title="펫"
         >
           <Sparkles size={20} />
         </button>
@@ -368,7 +368,7 @@ export function SettingsWindow() {
           className="rail-button"
           type="button"
           onClick={() => scrollToPanel("size-section")}
-          title="尺寸"
+          title="크기"
         >
           <ZoomIn size={20} />
         </button>
@@ -376,7 +376,7 @@ export function SettingsWindow() {
           className="rail-button"
           type="button"
           onClick={() => scrollToPanel("motion-section")}
-          title="动作"
+          title="동작"
         >
           <Play size={20} />
         </button>
@@ -384,7 +384,7 @@ export function SettingsWindow() {
           className="rail-button"
           type="button"
           onClick={() => scrollToPanel("chat-section")}
-          title="对话"
+          title="대화"
         >
           <MessageCircle size={20} />
         </button>
@@ -392,7 +392,7 @@ export function SettingsWindow() {
           className="rail-button"
           type="button"
           onClick={() => scrollToPanel("gallery-section")}
-          title="图鉴"
+          title="갤러리"
         >
           <Globe2 size={20} />
         </button>
@@ -414,14 +414,14 @@ export function SettingsWindow() {
           <div className="hero-copy">
             <div className="panel-title">
               <ZoomIn size={20} />
-              <h2>大小缩放</h2>
+              <h2>크기 조절</h2>
             </div>
             <div className="scale-readout">{scalePercent}%</div>
-            <p>直接拖动滑杆，桌宠会按原始比例缩放；下方也保留精确宽高。</p>
+            <p>슬라이더를 드래그하면 원래 비율로 크기가 바뀝니다. 아래에서 정확한 너비와 높이도 조절할 수 있습니다.</p>
           </div>
           <div className="scale-controls">
             <input
-              aria-label="桌宠缩放"
+              aria-label="펫 크기 조절"
               className="scale-slider"
               type="range"
               min="50"
@@ -444,15 +444,15 @@ export function SettingsWindow() {
           <section className="panel pet-panel" id="pet-section">
             <div className="panel-title">
               <Sparkles size={18} />
-              <h2>宠物</h2>
+              <h2>펫</h2>
             </div>
             <label className="field">
-              <span>当前宠物</span>
+              <span>현재 펫</span>
               <select
                 value={settings.activePetId ?? ""}
-                onChange={(event) => update("activePetId", event.target.value, "宠物已切换")}
+                onChange={(event) => update("activePetId", event.target.value, "펫을 변경했습니다")}
               >
-                {packages.length === 0 ? <option value="">没有找到宠物包</option> : null}
+                {packages.length === 0 ? <option value="">펫 패키지를 찾지 못했습니다</option> : null}
                 {packages.map((pet) => (
                   <option key={`${pet.rootDir}-${pet.id}`} value={pet.id}>
                     {pet.displayName}
@@ -474,7 +474,7 @@ export function SettingsWindow() {
             <div className="button-row">
               <button onClick={refresh} type="button">
                 <RefreshCw size={16} />
-                刷新
+                새로고침
               </button>
               <button
                 onClick={() => activePet && revealPetFolder(activePet.rootDir)}
@@ -482,7 +482,7 @@ export function SettingsWindow() {
                 disabled={!activePet}
               >
                 <FolderOpen size={16} />
-                文件夹
+                폴더
               </button>
             </div>
           </section>
@@ -490,15 +490,15 @@ export function SettingsWindow() {
           <section className="panel pet-folders-panel">
             <div className="panel-title">
               <FolderPlus size={18} />
-              <h2>宠物文件夹</h2>
+              <h2>펫 폴더</h2>
             </div>
             <div className="folder-picker">
               <label className="field">
-                <span>自定义路径</span>
+                <span>사용자 지정 경로</span>
                 <input
                   type="text"
                   value={newPetFolder}
-                  placeholder="例如 D:\\Pets 或 ~/pets"
+                  placeholder="예: D:\\Pets 또는 ~/pets"
                   onChange={(event) => setNewPetFolder(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") {
@@ -510,24 +510,24 @@ export function SettingsWindow() {
               <div className="button-row folder-actions">
                 <button type="button" onClick={() => addPetFolder()}>
                   <Plus size={16} />
-                  添加
+                  추가
                 </button>
                 <button type="button" onClick={chooseAndAddPetFolder}>
                   <FolderOpen size={16} />
-                  选择
+                  선택
                 </button>
               </div>
             </div>
             <div className="folder-list">
               {settings.petFolders.length === 0 ? (
-                <span className="folder-empty">未添加自定义文件夹</span>
+                <span className="folder-empty">추가된 사용자 지정 폴더가 없습니다</span>
               ) : (
                 settings.petFolders.map((folder) => (
                   <div className="folder-item" key={folder}>
                     <span title={folder}>{folder}</span>
                     <button
                       type="button"
-                      aria-label={`移除 ${folder}`}
+                      aria-label={`${folder} 제거`}
                       onClick={() => removePetFolder(folder)}
                     >
                       <Trash2 size={15} />
@@ -541,11 +541,11 @@ export function SettingsWindow() {
           <section className="panel gallery-panel" id="gallery-section">
             <div className="panel-title">
               <Globe2 size={18} />
-              <h2>在线图鉴</h2>
+              <h2>온라인 갤러리</h2>
             </div>
             <div className="gallery-controls">
               <label className="field">
-                <span>索引地址</span>
+                <span>색인 주소</span>
                 <input
                   type="url"
                   value={galleryUrlDraft}
@@ -554,22 +554,22 @@ export function SettingsWindow() {
                 />
               </label>
               <label className="field">
-                <span>搜索</span>
+                <span>검색</span>
                 <input
                   type="search"
                   value={gallerySearch}
-                  placeholder="名称、作者、标签"
+                  placeholder="이름, 제작자, 태그"
                   onChange={(event) => setGallerySearch(event.target.value)}
                 />
               </label>
               <button type="button" onClick={() => loadGallery()} disabled={galleryLoading}>
                 <Search size={16} />
-                {galleryLoading ? "读取中" : "读取图鉴"}
+                {galleryLoading ? "불러오는 중" : "갤러리 불러오기"}
               </button>
             </div>
             <div className="gallery-list">
               {filteredGalleryPets.length === 0 ? (
-                <span className="folder-empty">暂无可显示的桌宠</span>
+                <span className="folder-empty">표시할 펫이 없습니다</span>
               ) : (
                 filteredGalleryPets.map((pet) => (
                   <article className="gallery-pet-card" key={`${pet.id}-${pet.version}`}>
@@ -586,7 +586,7 @@ export function SettingsWindow() {
                     </div>
                     <button type="button" onClick={() => importGalleryPet(pet)}>
                       <Download size={16} />
-                      导入
+                      가져오기
                     </button>
                   </article>
                 ))
@@ -597,16 +597,16 @@ export function SettingsWindow() {
           <section className="panel">
             <div className="panel-title">
               <Maximize2 size={18} />
-              <h2>精确尺寸</h2>
+              <h2>정확한 크기</h2>
             </div>
             <ToggleRow
-              label="锁定原始比例"
+              label="원래 비율 유지"
               value={settings.keepAspectRatio}
-              onChange={(value) => update("keepAspectRatio", value, "比例锁定已更新")}
+              onChange={(value) => update("keepAspectRatio", value, "비율 잠금을 변경했습니다")}
             />
             <div className="split-fields">
               <NumberField
-                label="宽度"
+                label="너비"
                 value={settings.width}
                 min={96}
                 max={1200}
@@ -618,7 +618,7 @@ export function SettingsWindow() {
                 }}
               />
               <NumberField
-                label="高度"
+                label="높이"
                 value={settings.height}
                 min={104}
                 max={1300}
@@ -635,7 +635,7 @@ export function SettingsWindow() {
           <section className="panel">
             <div className="panel-title">
               <Move size={18} />
-              <h2>位置</h2>
+              <h2>위치</h2>
             </div>
             <div className="split-fields">
               <NumberField
@@ -655,7 +655,7 @@ export function SettingsWindow() {
             </div>
             <button className="wide-button" onClick={resetPosition} type="button">
               <Move size={16} />
-              回到左上角
+              왼쪽 위로 이동
             </button>
           </section>
 
@@ -714,35 +714,35 @@ export function SettingsWindow() {
           <section className="panel llm-panel" id="chat-section">
             <div className="panel-title">
               <Bot size={18} />
-              <h2>AI 对话</h2>
+              <h2>AI 대화</h2>
             </div>
             <ToggleRow
-              label="启用桌宠对话"
+              label="펫 대화 사용"
               value={settings.llmChatEnabled}
               onChange={(value) =>
-                update("llmChatEnabled", value, value ? "对话按钮已显示" : "对话已关闭")
+                update("llmChatEnabled", value, value ? "대화 버튼을 표시했습니다" : "대화를 껐습니다")
               }
             />
             <p className="panel-note">
-              开启后，桌宠旁会出现对话按钮。接口按 OpenAI 兼容格式请求，本地模型可以不填 Key。
+              켜면 펫 옆에 대화 버튼이 나타납니다. OpenAI 호환 API를 사용하며, 로컬 모델은 API 키가 없어도 됩니다.
             </p>
             <label className="field">
-              <span>接口地址</span>
+              <span>API 주소</span>
               <input
                 type="url"
                 value={settings.llmEndpoint}
-                placeholder="例如 https://api.example.com/v1"
-                onChange={(event) => update("llmEndpoint", event.target.value, "接口已保存")}
+                placeholder="예: https://api.example.com/v1"
+                onChange={(event) => update("llmEndpoint", event.target.value, "API 주소를 저장했습니다")}
               />
             </label>
             <div className="split-fields">
               <label className="field">
-                <span>模型</span>
+                <span>모델</span>
                 <input
                   type="text"
                   value={settings.llmModel}
-                  placeholder="例如 gpt-4.1-mini / qwen-plus"
-                  onChange={(event) => update("llmModel", event.target.value, "模型已保存")}
+                  placeholder="예: gpt-4.1-mini / qwen-plus"
+                  onChange={(event) => update("llmModel", event.target.value, "모델을 저장했습니다")}
                 />
               </label>
               <label className="field">
@@ -753,13 +753,13 @@ export function SettingsWindow() {
                 <input
                   type="password"
                   value={settings.llmApiKey}
-                  placeholder="本地保存"
-                  onChange={(event) => update("llmApiKey", event.target.value, "Key 已保存")}
+                  placeholder="로컬에 저장됨"
+                  onChange={(event) => update("llmApiKey", event.target.value, "API 키를 저장했습니다")}
                 />
               </label>
             </div>
             <label className="slider-field">
-              <span>温度</span>
+              <span>온도</span>
               <input
                 type="range"
                 min="0"
@@ -767,18 +767,18 @@ export function SettingsWindow() {
                 step="0.05"
                 value={settings.llmTemperature}
                 onChange={(event) =>
-                  update("llmTemperature", Number(event.target.value), "温度已更新")
+                  update("llmTemperature", Number(event.target.value), "온도를 변경했습니다")
                 }
               />
               <output>{settings.llmTemperature.toFixed(2)}</output>
             </label>
             <label className="field">
-              <span>桌宠口吻</span>
+              <span>펫 말투</span>
               <textarea
                 rows={4}
                 value={settings.llmSystemPrompt}
                 onChange={(event) =>
-                  update("llmSystemPrompt", event.target.value, "口吻已保存")
+                  update("llmSystemPrompt", event.target.value, "펫 말투를 저장했습니다")
                 }
               />
             </label>
@@ -787,30 +787,30 @@ export function SettingsWindow() {
           <section className="panel">
             <div className="panel-title">
               <Lock size={18} />
-              <h2>行为</h2>
+              <h2>동작 설정</h2>
             </div>
             <ToggleRow
-              label="桌宠置顶"
+              label="항상 위에 표시"
               value={settings.alwaysOnTop}
-              onChange={(value) => update("alwaysOnTop", value, "置顶已更新")}
+              onChange={(value) => update("alwaysOnTop", value, "항상 위 표시를 변경했습니다")}
             />
             <ToggleRow
-              label="允许拖动桌宠"
+              label="펫 드래그 허용"
               value={settings.dragEnabled && !settings.locked}
               onChange={toggleDragging}
             />
             <ToggleRow
-              label="鼠标穿透"
+              label="마우스 클릭 통과"
               value={settings.clickThrough}
-              onChange={(value) => update("clickThrough", value, "鼠标穿透已更新")}
+              onChange={(value) => update("clickThrough", value, "마우스 클릭 통과를 변경했습니다")}
             />
             <ToggleRow
-              label="启动时显示"
+              label="시작 시 표시"
               value={settings.showOnStartup}
-              onChange={(value) => update("showOnStartup", value, "启动显示已更新")}
+              onChange={(value) => update("showOnStartup", value, "시작 시 표시를 변경했습니다")}
             />
             <ToggleRow
-              label="开机自启"
+              label="Windows 시작 시 실행"
               value={settings.autostart}
               onChange={toggleAutostart}
               icon={<Rocket size={16} />}
@@ -820,24 +820,24 @@ export function SettingsWindow() {
           <section className={`panel update-panel is-${updateCheck.status}`}>
             <div className="panel-title">
               <BadgeCheck size={18} />
-              <h2>更新</h2>
+              <h2>업데이트</h2>
             </div>
             <div className="update-card">
               <strong>
                 {updateCheck.status === "available"
-                  ? `发现新版本 ${updateCheck.latestVersion}`
+                  ? `새 버전 ${updateCheck.latestVersion}을 찾았습니다`
                   : updateCheck.status === "latest"
-                    ? "当前已是最新版本"
+                    ? "최신 버전입니다"
                     : updateCheck.status === "checking"
-                      ? "正在检查更新"
+                      ? "업데이트 확인 중"
                       : updateCheck.status === "error"
-                        ? "暂时无法检查更新"
-                        : "检查更新"}
+                        ? "지금은 업데이트를 확인할 수 없습니다"
+                        : "업데이트 확인"}
               </strong>
               <span>{updateCheck.message}</span>
               <small>
-                当前版本 {updateCheck.currentVersion || "未知"}
-                {updateCheck.latestVersion ? ` · 最新版本 ${updateCheck.latestVersion}` : ""}
+                현재 버전 {updateCheck.currentVersion || "알 수 없음"}
+                {updateCheck.latestVersion ? ` · 최신 버전 ${updateCheck.latestVersion}` : ""}
               </small>
             </div>
             <div className="button-row">
@@ -847,7 +847,7 @@ export function SettingsWindow() {
                 disabled={updateCheck.status === "checking"}
               >
                 <RefreshCw size={16} />
-                {updateCheck.status === "checking" ? "检查中" : "检查更新"}
+                {updateCheck.status === "checking" ? "확인 중" : "업데이트 확인"}
               </button>
               <a
                 className="settings-link-button"
@@ -856,7 +856,7 @@ export function SettingsWindow() {
                 rel="noreferrer"
               >
                 <ExternalLink size={16} />
-                发布页
+                배포 페이지
               </a>
             </div>
           </section>
@@ -864,12 +864,12 @@ export function SettingsWindow() {
           <section className="panel compact-panel">
             <div className="panel-title">
               <Eye size={18} />
-              <h2>当前渲染</h2>
+              <h2>현재 렌더링</h2>
             </div>
             <div className="render-facts">
               <span>{settings.width} x {settings.height}</span>
               <span>{STATE_LABELS[settings.manualState]}</span>
-              <span>{settings.pixelated ? "像素" : "平滑"}</span>
+              <span>{settings.pixelated ? "픽셀" : "부드럽게"}</span>
             </div>
           </section>
         </div>
@@ -893,7 +893,7 @@ function createUpdateCheckState(result: UpdateCheckResult): UpdateCheckState {
       currentVersion: result.currentVersion,
       latestVersion: "",
       releaseUrl: result.releaseUrl,
-      message: "自动检查没有拿到版本号，可以直接打开发布页查看最新版。",
+      message: "자동 업데이트 확인에서 버전 정보를 받지 못했습니다. 배포 페이지에서 최신 버전을 확인하세요.",
     };
   }
 
@@ -903,7 +903,7 @@ function createUpdateCheckState(result: UpdateCheckResult): UpdateCheckState {
       currentVersion: result.currentVersion,
       latestVersion: result.latestVersion,
       releaseUrl: result.releaseUrl,
-      message: "新版已经发布，点下面的「发布页」下载安装包。",
+      message: "새 버전이 배포되었습니다. 아래 ‘배포 페이지’에서 설치 파일을 받으세요.",
     };
   }
 
@@ -912,7 +912,7 @@ function createUpdateCheckState(result: UpdateCheckResult): UpdateCheckState {
     currentVersion: result.currentVersion,
     latestVersion: result.latestVersion,
     releaseUrl: result.releaseUrl,
-    message: "你正在使用最新版本。",
+    message: "최신 버전을 사용 중입니다.",
   };
 }
 
@@ -963,7 +963,7 @@ function resolveGalleryUrl(value: string | undefined, indexUrl: string): string 
 
 function formatBytes(value?: number): string {
   if (!value) {
-    return "未知大小";
+    return "알 수 없는 크기";
   }
   if (value < 1024 * 1024) {
     return `${(value / 1024).toFixed(1)} KB`;

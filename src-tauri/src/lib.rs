@@ -411,12 +411,12 @@ async fn send_llm_chat(
 ) -> Result<LlmChatResponse, String> {
     let endpoint = request.endpoint.trim();
     if endpoint.is_empty() {
-        return Err("请先填写接口地址".to_string());
+        return Err("API 주소를 먼저 입력하세요".to_string());
     }
 
     let model = request.model.trim();
     if model.is_empty() {
-        return Err("请先填写模型名称".to_string());
+        return Err("모델 이름을 먼저 입력하세요".to_string());
     }
 
     let mut messages = Vec::new();
@@ -441,7 +441,7 @@ async fn send_llm_chat(
     }
 
     if !messages.iter().any(|message| message.role == "user") {
-        return Err("没有可发送的用户消息".to_string());
+        return Err("전송할 사용자 메시지가 없습니다".to_string());
     }
 
     let url = normalize_chat_completion_url(endpoint)?;
@@ -465,18 +465,21 @@ async fn send_llm_chat(
     let status = response.status();
     let body = response.text().await.map_err(|error| error.to_string())?;
     if !status.is_success() {
-        return Err(format!("模型接口返回 {status}: {}", shorten_error(&body)));
+        return Err(format!(
+            "모델 API가 {status}를 반환했습니다: {}",
+            shorten_error(&body)
+        ));
     }
 
     let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
         format!(
-            "模型接口返回的不是有效 JSON: {error}; {}",
+            "모델 API 응답이 올바른 JSON이 아닙니다: {error}; {}",
             shorten_error(&body)
         )
     })?;
     extract_chat_content(&value)
         .map(|content| LlmChatResponse { content })
-        .ok_or_else(|| "没有在模型返回里找到回复文本".to_string())
+        .ok_or_else(|| "모델 응답에서 답변 텍스트를 찾지 못했습니다".to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1215,7 +1218,7 @@ fn normalize_chat_completion_url(endpoint: &str) -> Result<String, String> {
     let trimmed = endpoint.trim().trim_end_matches('/');
     let parsed = reqwest::Url::parse(trimmed).map_err(|error| error.to_string())?;
     if !matches!(parsed.scheme(), "https" | "http") {
-        return Err("接口地址只支持 http 或 https".to_string());
+        return Err("API 주소는 http 또는 https만 지원합니다".to_string());
     }
 
     if parsed.path().ends_with("/chat/completions") {
