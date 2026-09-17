@@ -422,7 +422,7 @@ export function PetWindow() {
     }
 
     if (!settings.llmEndpoint.trim() || !settings.llmModel.trim()) {
-      setChatError("请先在设置里填写接口地址和模型名称。");
+      setChatError("설정에서 API 주소와 모델 이름을 먼저 입력하세요.");
       setChatPhase("error");
       return;
     }
@@ -810,7 +810,7 @@ export function PetWindow() {
           <div className="pet-chat-messages" ref={chatScrollRef}>
             {chatMessages.length === 0 ? (
               <div className="pet-chat-empty">
-                和我说句话吧。我会根据聊天内容切换待机、工作、检查结果、挥手或跳跃动作。
+                말을 걸어 보세요. 대기, 작업, 결과 확인, 손 흔들기, 점프 동작이 대화 상태에 따라 바뀝니다.
               </div>
             ) : (
               chatMessages.map((message, index) => (
@@ -832,7 +832,7 @@ export function PetWindow() {
 
           {!settings.llmEndpoint.trim() || !settings.llmModel.trim() ? (
             <button className="pet-chat-config-button" type="button" onClick={() => showSettingsWindow()}>
-              去设置接口
+              API 설정으로 이동
             </button>
           ) : (
             <form
@@ -844,7 +844,7 @@ export function PetWindow() {
             >
               <textarea
                 value={chatDraft}
-                placeholder="输入后回车发送"
+                placeholder="입력 후 Enter로 전송"
                 onFocus={() => setChatPhase("editing")}
                 onChange={(event) => {
                   setChatDraft(event.target.value);

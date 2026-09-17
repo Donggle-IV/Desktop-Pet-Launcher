@@ -527,15 +527,15 @@ pub fn run() {
 }
 
 fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    let show_hide = MenuItem::with_id(app, "toggle_pet", "显示/隐藏", true, None::<&str>)?;
-    let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
-    let lock = MenuItem::with_id(app, "toggle_lock", "锁定/解锁", true, None::<&str>)?;
-    let refresh = MenuItem::with_id(app, "refresh_pets", "刷新宠物", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let show_hide = MenuItem::with_id(app, "toggle_pet", "펫 표시/숨기기", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "설정", true, None::<&str>)?;
+    let lock = MenuItem::with_id(app, "toggle_lock", "잠금/잠금 해제", true, None::<&str>)?;
+    let refresh = MenuItem::with_id(app, "refresh_pets", "펫 새로고침", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_hide, &settings, &lock, &refresh, &quit])?;
 
     let mut tray_builder = TrayIconBuilder::with_id("desktop-pet-tray")
-        .tooltip("桌宠")
+        .tooltip("데스크톱 펫")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -592,7 +592,7 @@ fn ensure_settings_window<R: Runtime>(app: &AppHandle<R>) -> Result<WebviewWindo
         "settings",
         WebviewUrl::App("index.html#settings".into()),
     )
-    .title("桌宠设置")
+    .title("데스크톱 펫 설정")
     .inner_size(880.0, 640.0)
     .min_inner_size(760.0, 560.0)
     .resizable(true)

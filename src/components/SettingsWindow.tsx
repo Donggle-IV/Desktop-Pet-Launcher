@@ -49,15 +49,27 @@ import {
 } from "../lib/tauriApi";
 
 const STATE_LABELS: Record<PetState, string> = {
-  idle: "待机",
-  "running-right": "向右跑动",
-  "running-left": "向左跑动",
-  waving: "挥手",
-  jumping: "跳跃",
-  failed: "失败",
-  waiting: "等待输入",
-  running: "工作中",
-  review: "检查结果",
+  idle: "대기",
+  "running-right": "오른쪽으로 달리기",
+  "running-left": "왼쪽으로 달리기",
+  waving: "손 흔들기",
+  jumping: "점프",
+  failed: "오류",
+  waiting: "입력 대기",
+  running: "작업 중",
+  review: "검토 / 결과 확인",
+};
+
+const STATE_HINTS: Record<PetState, string> = {
+  idle: "기본 상태입니다. ‘대기 동작 다양화’가 켜져 있으면 가끔 다른 동작을 짧게 재생합니다.",
+  "running-right": "펫을 오른쪽으로 드래그할 때 자동으로 재생됩니다.",
+  "running-left": "펫을 왼쪽으로 드래그할 때 자동으로 재생됩니다.",
+  waving: "수동 선택하거나, AI 채팅을 열었을 때 인사 동작으로 재생됩니다.",
+  jumping: "수동 선택하거나, AI 응답에 긍정적인 표현이 있을 때 재생됩니다.",
+  failed: "수동 선택하거나, AI 채팅 오류 시 재생됩니다.",
+  waiting: "수동 선택하거나, AI 채팅 입력 중 재생됩니다.",
+  running: "수동 선택하거나, AI 응답을 기다리는 동안 재생됩니다.",
+  review: "수동 선택하거나, AI 응답의 기본 완료 상태로 재생됩니다.",
 };
 
 type UpdateCheckStatus = "idle" | "checking" | "available" | "latest" | "error";
@@ -390,7 +402,7 @@ export function SettingsWindow() {
         <header className="settings-header">
           <div>
             <p className="eyebrow">Desktop Pet</p>
-            <h1>桌宠设置</h1>
+            <h1>데스크톱 펫 설정</h1>
           </div>
           <div className="status-pill">
             <Save size={16} />
@@ -650,14 +662,14 @@ export function SettingsWindow() {
           <section className="panel" id="motion-section">
             <div className="panel-title">
               <Play size={18} />
-              <h2>动作</h2>
+              <h2>동작</h2>
             </div>
             <label className="field">
-              <span>当前动作</span>
+              <span>현재 동작</span>
               <select
                 value={settings.manualState}
                 onChange={(event) =>
-                  update("manualState", event.target.value as PetState, "动作已切换")
+                  update("manualState", event.target.value as PetState, "동작을 변경했습니다")
                 }
               >
                 {PET_STATES.map((state) => (
@@ -667,8 +679,9 @@ export function SettingsWindow() {
                 ))}
               </select>
             </label>
+            <p className="panel-note">{STATE_HINTS[settings.manualState]}</p>
             <label className="slider-field">
-              <span>速度</span>
+              <span>속도</span>
               <input
                 type="range"
                 min="0.25"
@@ -676,25 +689,25 @@ export function SettingsWindow() {
                 step="0.05"
                 value={settings.animationSpeed}
                 onChange={(event) =>
-                  update("animationSpeed", Number(event.target.value), "速度已更新")
+                  update("animationSpeed", Number(event.target.value), "속도를 변경했습니다")
                 }
               />
               <output>{settings.animationSpeed.toFixed(2)}x</output>
             </label>
             <ToggleRow
-              label="待机动作多样化"
+              label="대기 동작 다양화"
               value={settings.idleVariety}
-              onChange={(value) => update("idleVariety", value, "待机动作已更新")}
+              onChange={(value) => update("idleVariety", value, "대기 동작을 변경했습니다")}
             />
             <ToggleRow
-              label="减少动态"
+              label="동작 줄이기"
               value={settings.reducedMotion}
-              onChange={(value) => update("reducedMotion", value, "动态偏好已更新")}
+              onChange={(value) => update("reducedMotion", value, "동작 설정을 변경했습니다")}
             />
             <ToggleRow
-              label="像素风渲染"
+              label="픽셀 스타일 렌더링"
               value={settings.pixelated}
-              onChange={(value) => update("pixelated", value, "渲染方式已更新")}
+              onChange={(value) => update("pixelated", value, "렌더링 방식을 변경했습니다")}
             />
           </section>
 

@@ -132,7 +132,7 @@ export async function choosePetFolder(): Promise<string | null> {
   const selected = await open({
     directory: true,
     multiple: false,
-    title: "选择宠物文件夹",
+    title: "펫 폴더 선택",
   });
   return typeof selected === "string" ? selected : null;
 }
