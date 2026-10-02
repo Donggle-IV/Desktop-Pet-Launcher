@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONFIG_FILE: &str = "workflow-tracker-config.json";
 const CHECKPOINT_FILE: &str = "workflow-tracker.json";
@@ -39,6 +40,9 @@ pub(crate) struct ProjectCheckpoint {
     pub(crate) last_artifact_commit: Option<String>,
     #[serde(default)]
     pub(crate) last_observed_sha: Option<String>,
+    /// Local user-confirmation time for an Execution completion without Git evidence.
+    #[serde(default)]
+    pub(crate) manual_completed_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +217,7 @@ impl WorkflowTracker {
             last_artifact: previous.last_artifact,
             last_artifact_commit: previous.last_artifact_commit,
             last_observed_sha: Some(baseline_sha),
+            manual_completed_at: None,
         };
         set_state(&mut inner.checkpoint, project, Some(next.clone()));
         persist(&inner)?;
@@ -294,11 +299,35 @@ impl WorkflowTracker {
                 .as_ref()
                 .and_then(|state| state.last_artifact_commit.clone()),
             last_observed_sha: observed_sha,
+            manual_completed_at: None,
         };
         set_state(&mut inner.checkpoint, project, Some(next.clone()));
         persist(&inner)?;
         Ok(queue.restore(project, queue_input(&next)))
     }
+
+    pub(crate) fn complete_execution(
+        &self,
+        project: ProjectId,
+        queue: &QueueRuntime,
+    ) -> Result<QueueMutation, String> {
+        let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
+        let current = state_for(&inner.checkpoint, project)
+            .cloned()
+            .ok_or_else(|| "project workflow is not configured".to_string())?;
+        validate_manual_execution_completion(&current)?;
+        let completed = manually_completed_execution(&current, unix_time_millis());
+        set_state(&mut inner.checkpoint, project, Some(completed.clone()));
+        persist(&inner)?;
+        queue.replace(project, queue_input(&completed))
+    }
+}
+
+fn validate_manual_execution_completion(current: &ProjectCheckpoint) -> Result<(), String> {
+    if current.current_role != WorkflowRole::Execution || current.status != TrackerStatus::Running {
+        return Err("only a running Execution workflow may be manually completed".to_string());
+    }
+    Ok(())
 }
 
 fn startup_state_for(
@@ -357,16 +386,19 @@ fn completed_timestamp(
             })?;
             let repository = gpt_prompt_repository(config)?;
             fetch_and_head(&repository)?;
-            commit_timestamp(&repository, commit)
+            git_timestamp_millis(commit_timestamp(&repository, commit)?)
         }
         WorkflowRole::Execution => {
+            if let Some(timestamp) = state.manual_completed_at {
+                return Ok(timestamp);
+            }
             let commit = state.last_observed_sha.as_deref().ok_or_else(|| {
                 "completed Execution workflow has no observed commit identity; use Settings alignment"
                     .to_string()
             })?;
             let repository = project_repository(project, config);
             fetch_and_head(&repository)?;
-            commit_timestamp(&repository, commit)
+            git_timestamp_millis(commit_timestamp(&repository, commit)?)
         }
     }
 }
@@ -376,6 +408,21 @@ fn latest_completed_state(
     config: &TrackerConfigFile,
 ) -> Result<Option<ProjectCheckpoint>, String> {
     Ok(latest_completed_evidence(project, config)?.map(BootstrapEvidence::state))
+}
+
+fn git_timestamp_millis(timestamp_seconds: u64) -> Result<u64, String> {
+    timestamp_seconds
+        .checked_mul(1_000)
+        .ok_or_else(|| "Git commit timestamp is too large".to_string())
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn completion_for(
@@ -452,6 +499,22 @@ fn completed_execution(current: &ProjectCheckpoint, head: String) -> ProjectChec
         last_artifact: current.last_artifact.clone(),
         last_artifact_commit: current.last_artifact_commit.clone(),
         last_observed_sha: Some(head),
+        manual_completed_at: None,
+    }
+}
+
+fn manually_completed_execution(current: &ProjectCheckpoint, timestamp: u64) -> ProjectCheckpoint {
+    ProjectCheckpoint {
+        current_role: WorkflowRole::Execution,
+        status: TrackerStatus::Completed,
+        label: current.label.clone(),
+        next_role: Some(WorkflowRole::Prepare),
+        baseline_sha: current.baseline_sha.clone(),
+        baseline_source: current.baseline_source.clone(),
+        last_artifact: current.last_artifact.clone(),
+        last_artifact_commit: current.last_artifact_commit.clone(),
+        last_observed_sha: current.last_observed_sha.clone(),
+        manual_completed_at: Some(timestamp),
     }
 }
 
@@ -471,6 +534,7 @@ fn completed_artifact(
         last_artifact: Some(artifact.path),
         last_artifact_commit: Some(artifact.commit),
         last_observed_sha: Some(head),
+        manual_completed_at: None,
     }
 }
 
@@ -722,6 +786,7 @@ impl BootstrapEvidence {
             last_artifact,
             last_artifact_commit,
             last_observed_sha: Some(self.evidence_sha),
+            manual_completed_at: None,
         }
     }
 }
@@ -754,7 +819,10 @@ fn latest_completed_evidence(
                 role: WorkflowRole::Prepare,
                 next_role,
                 evidence_sha: artifact.commit.clone(),
-                evidence_timestamp: commit_timestamp(&gpt_prompt, &artifact.commit)?,
+                evidence_timestamp: git_timestamp_millis(commit_timestamp(
+                    &gpt_prompt,
+                    &artifact.commit,
+                )?)?,
                 artifact: Some(artifact),
             });
         }
@@ -764,11 +832,15 @@ fn latest_completed_evidence(
             role: WorkflowRole::Qa,
             next_role: WorkflowRole::Prepare,
             evidence_sha: artifact.commit.clone(),
-            evidence_timestamp: commit_timestamp(&gpt_prompt, &artifact.commit)?,
+            evidence_timestamp: git_timestamp_millis(commit_timestamp(
+                &gpt_prompt,
+                &artifact.commit,
+            )?)?,
             artifact: Some(artifact),
         });
     }
-    let (execution_head, execution_timestamp) = fetch_head_with_timestamp(&target)?;
+    let (execution_head, execution_timestamp_seconds) = fetch_head_with_timestamp(&target)?;
+    let execution_timestamp = git_timestamp_millis(execution_timestamp_seconds)?;
     let execution_anchor = candidates
         .iter()
         .filter(|candidate| {
@@ -861,6 +933,7 @@ mod tests {
             last_artifact: None,
             last_artifact_commit: None,
             last_observed_sha: None,
+            manual_completed_at: None,
         };
         assert_eq!(queue_input(&state).status, InputStatus::Completed);
     }
@@ -876,6 +949,7 @@ mod tests {
             last_artifact: None,
             last_artifact_commit: None,
             last_observed_sha: Some("abc123".to_string()),
+            manual_completed_at: None,
         }
     }
 
@@ -1084,6 +1158,60 @@ mod tests {
             .restore(ProjectId::Fgo, queue_input(&completed))
             .completed
             .is_none());
+    }
+
+    #[test]
+    fn manual_execution_completion_validates_role_and_preserves_anchor() {
+        let mut execution = running(WorkflowRole::Execution);
+        execution.last_artifact = Some("noctua/prepare/p1-execution-handoff.md".to_string());
+        execution.last_artifact_commit = Some("P1".to_string());
+        execution.last_observed_sha = Some("E0".to_string());
+        assert!(validate_manual_execution_completion(&execution).is_ok());
+        let completed = manually_completed_execution(&execution, 1_420_000);
+        assert_eq!(completed.status, TrackerStatus::Completed);
+        assert_eq!(completed.next_role, Some(WorkflowRole::Prepare));
+        assert_eq!(completed.last_artifact_commit.as_deref(), Some("P1"));
+        assert_eq!(completed.manual_completed_at, Some(1_420_000));
+        assert_eq!(
+            artifact_anchor_for_transition(WorkflowRole::Prepare, &completed).unwrap(),
+            "P1"
+        );
+        let queue = QueueRuntime::default();
+        queue.restore(ProjectId::Noctua, queue_input(&execution));
+        assert!(queue
+            .replace(ProjectId::Noctua, queue_input(&completed))
+            .unwrap()
+            .completed
+            .is_some());
+        assert!(validate_manual_execution_completion(&completed).is_err());
+        assert!(validate_manual_execution_completion(&running(WorkflowRole::Prepare)).is_err());
+        assert!(validate_manual_execution_completion(&running(WorkflowRole::Qa)).is_err());
+    }
+
+    #[test]
+    fn manual_completion_uses_milliseconds_against_git_evidence() {
+        let manual = manually_completed_execution(&running(WorkflowRole::Execution), 1_420_000);
+        let older_prepare = evidence(WorkflowRole::Prepare, git_timestamp_millis(1_400).unwrap());
+        let newer_prepare = evidence(WorkflowRole::Prepare, git_timestamp_millis(1_435).unwrap());
+        assert_eq!(
+            newer_completed_state(&manual, manual.manual_completed_at.unwrap(), older_prepare)
+                .current_role,
+            WorkflowRole::Execution
+        );
+        assert_eq!(
+            newer_completed_state(&manual, manual.manual_completed_at.unwrap(), newer_prepare)
+                .current_role,
+            WorkflowRole::Prepare
+        );
+    }
+
+    #[test]
+    fn automatic_execution_completion_has_no_manual_timestamp() {
+        assert_eq!(
+            completed_execution(&running(WorkflowRole::Execution), "E1".to_string())
+                .manual_completed_at,
+            None
+        );
     }
 
     #[test]

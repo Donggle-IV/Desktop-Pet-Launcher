@@ -509,6 +509,18 @@ fn advance_project_workflow(
 }
 
 #[tauri::command]
+fn complete_execution_workflow(
+    project: ProjectId,
+    app: AppHandle,
+    tracker: tauri::State<'_, WorkflowTracker>,
+    queue: tauri::State<'_, QueueRuntime>,
+) -> Result<(), String> {
+    let mutation = tracker.complete_execution(project, &queue)?;
+    queue_bridge::emit_mutation(&app, mutation);
+    Ok(())
+}
+
+#[tauri::command]
 fn get_workflow_handoff_target(
     project: ProjectId,
     tracker: tauri::State<'_, WorkflowTracker>,
@@ -594,6 +606,7 @@ pub fn run() {
             send_llm_chat,
             get_queue_state,
             advance_project_workflow,
+            complete_execution_workflow,
             get_workflow_handoff_target,
             get_project_workflow,
             align_project_workflow,

@@ -121,6 +121,13 @@ export async function advanceProjectWorkflow(project: ProjectId): Promise<void> 
   await invoke("advance_project_workflow", { project });
 }
 
+export async function completeExecutionWorkflow(project: ProjectId): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  await invoke("complete_execution_workflow", { project });
+}
+
 export async function getWorkflowHandoffTarget(project: ProjectId): Promise<WorkflowRole | null> {
   if (!isTauriRuntime()) {
     return null;

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { advanceProjectWorkflow, getWorkflowHandoffTarget } from "../lib/tauriApi";
+import { advanceProjectWorkflow, completeExecutionWorkflow, getWorkflowHandoffTarget } from "../lib/tauriApi";
 import { type ProjectId, type ProjectState, type QueueProjection, type WorkflowRole, stateForProject } from "../lib/queueContract";
 
 const PROJECTS: Array<{ id: ProjectId; label: string }> = [
@@ -49,6 +49,14 @@ function QueueRow({ name, project, state, nextRole }: { name: string; project: P
           void advanceProjectWorkflow(project).catch(() => undefined);
         }} aria-label={`${name} 작업을 ${nextRole} 역할로 전달`} title={`${nextRole.toUpperCase()}로 전달`}>
           ▶ {nextRole.toUpperCase()}
+        </button>
+      ) : null}
+      {state?.status === "running" && state.role === "execution" ? (
+        <button className="queue-handoff" type="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => {
+          event.stopPropagation();
+          void completeExecutionWorkflow(project).catch(() => undefined);
+        }} aria-label={`${name} Execution 작업 완료`} title="Execution 완료">
+          ✓ COMPLETE
         </button>
       ) : null}
     </div>
