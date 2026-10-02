@@ -189,8 +189,9 @@ impl WorkflowTracker {
                         eprintln!("workflow tracker checkpoint write failed: {error}");
                         continue;
                     }
+                    let mutation = queue.restore(project, queue_input(&state));
                     drop(inner);
-                    mutations.push(queue.restore(project, queue_input(&state)));
+                    mutations.push(mutation);
                 }
                 Ok(None) => {
                     let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
@@ -198,9 +199,12 @@ impl WorkflowTracker {
                         continue;
                     }
                     set_startup_fence(&mut inner.startup_fences, project, Some(gpt_head));
+                    let mutation = persisted
+                        .as_ref()
+                        .map(|state| queue.restore(project, queue_input(state)));
                     drop(inner);
-                    if let Some(state) = persisted {
-                        mutations.push(queue.restore(project, queue_input(&state)));
+                    if let Some(mutation) = mutation {
+                        mutations.push(mutation);
                     }
                 }
                 Err(error) => {
@@ -269,7 +273,6 @@ impl WorkflowTracker {
                 eprintln!("workflow tracker checkpoint write failed: {error}");
                 continue;
             }
-            drop(inner);
             let mutation = if current.status == TrackerStatus::Running {
                 queue
                     .replace(project, queue_input(&candidate))
@@ -277,6 +280,7 @@ impl WorkflowTracker {
             } else {
                 queue.restore(project, queue_input(&candidate))
             };
+            drop(inner);
             mutations.push(mutation);
         }
         mutations
@@ -324,15 +328,13 @@ impl WorkflowTracker {
                     return Ok((HandoffResult::Stale, None));
                 }
                 install_candidate(&mut inner, project, refreshed.clone(), Some(None))?;
+                let mutation = queue.restore(project, queue_input(&refreshed));
                 drop(inner);
-                return Ok((
-                    HandoffResult::Refreshed,
-                    Some(queue.restore(project, queue_input(&refreshed))),
-                ));
+                return Ok((HandoffResult::Refreshed, Some(mutation)));
             }
         }
         let next_role = expected_next_role;
-        let (baseline_sha, baseline_source, consumed_fence) =
+        let (baseline_sha, baseline_source, consumed_fence, consumed_recovery_anchor) =
             transition_baseline(project, next_role, &previous, &config, fence.as_deref())?;
         let next = ProjectCheckpoint {
             current_role: next_role,
@@ -346,7 +348,7 @@ impl WorkflowTracker {
             last_observed_sha: Some(baseline_sha),
             manual_completed_at: None,
             tracker_revision: previous.tracker_revision.saturating_add(1),
-            recovery_anchor: None,
+            recovery_anchor: next_recovery_anchor(next_role, &previous, consumed_recovery_anchor),
         };
         let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
         if !matches_current(&inner, project, &previous, fence.as_deref()) {
@@ -358,11 +360,12 @@ impl WorkflowTracker {
             next.clone(),
             consumed_fence.then_some(None),
         )?;
+        // QueueRuntime never acquires TrackerInner, so this short Tracker→Queue
+        // critical section cannot deadlock and prevents an older winner from
+        // projecting after a newer tracker revision has committed.
+        let mutation = queue.replace(project, queue_input(&next))?;
         drop(inner);
-        Ok((
-            HandoffResult::Advanced,
-            Some(queue.replace(project, queue_input(&next))?),
-        ))
+        Ok((HandoffResult::Advanced, Some(mutation)))
     }
 
     pub(crate) fn handoff_target(&self, project: ProjectId) -> Option<WorkflowRole> {
@@ -466,8 +469,9 @@ impl WorkflowTracker {
             );
         }
         install_candidate(&mut inner, project, next.clone(), Some(None))?;
+        let mutation = queue.restore(project, queue_input(&next));
         drop(inner);
-        Ok(queue.restore(project, queue_input(&next)))
+        Ok(mutation)
     }
 
     pub(crate) fn complete_execution(
@@ -486,8 +490,9 @@ impl WorkflowTracker {
         validate_manual_execution_completion(&current)?;
         let completed = manually_completed_execution(&current, unix_time_millis());
         install_candidate(&mut inner, project, completed.clone(), None)?;
+        let mutation = queue.replace(project, queue_input(&completed))?;
         drop(inner);
-        Ok(Some(queue.replace(project, queue_input(&completed))?))
+        Ok(Some(mutation))
     }
 }
 
@@ -634,9 +639,9 @@ fn startup_state_fold(
             }
         }
         let Some(anchor) = state
-            .last_artifact_commit
+            .recovery_anchor
             .as_deref()
-            .or(state.recovery_anchor.as_deref())
+            .or(state.last_artifact_commit.as_deref())
         else {
             break;
         };
@@ -1002,19 +1007,20 @@ fn transition_baseline(
     previous: &ProjectCheckpoint,
     config: &TrackerConfigFile,
     startup_fence: Option<&str>,
-) -> Result<(String, String, bool), String> {
+) -> Result<(String, String, bool, bool), String> {
     if next_role == WorkflowRole::Execution {
         let (baseline, source) = capture_baseline(project, next_role, config)?;
-        return Ok((baseline, source, false));
+        return Ok((baseline, source, false, false));
     }
-    let (anchor, consumed_fence) = gpt_transition_anchor(next_role, previous, startup_fence)?;
+    let (anchor, consumed_fence, consumed_recovery_anchor) =
+        gpt_transition_anchor(next_role, previous, startup_fence)?;
     if consumed_fence {
         let (repository, _) = fetch_gpt_prompt(config)?;
         let head = fetch_and_head(&repository)?;
         if !is_ancestor_of(&repository, &anchor, &head)? {
             return Err("startup gpt_prompt fence is no longer an ancestor of origin/main; use Settings alignment".to_string());
         }
-        return Ok((anchor, "origin/main".to_string(), true));
+        return Ok((anchor, "origin/main".to_string(), true, false));
     }
     let repository = GitRepository {
         path: config
@@ -1028,24 +1034,45 @@ fn transition_baseline(
     if !is_ancestor_of(&repository, &anchor, &head)? {
         return Err("stored gpt_prompt artifact anchor is no longer an ancestor of origin/main; use Settings alignment".to_string());
     }
-    Ok((anchor, "origin/main".to_string(), false))
+    Ok((
+        anchor,
+        "origin/main".to_string(),
+        false,
+        consumed_recovery_anchor,
+    ))
 }
 
 fn gpt_transition_anchor(
     next_role: WorkflowRole,
     previous: &ProjectCheckpoint,
     startup_fence: Option<&str>,
-) -> Result<(String, bool), String> {
+) -> Result<(String, bool, bool), String> {
     if next_role == WorkflowRole::Execution {
         return Err("Execution uses its target project remote baseline".to_string());
     }
     if let Some(fence) = startup_fence {
-        return Ok((fence.to_string(), true));
+        return Ok((fence.to_string(), true, false));
+    }
+    if let Some(recovery_anchor) = previous.recovery_anchor.as_deref() {
+        return Ok((recovery_anchor.to_string(), false, true));
     }
     Ok((
         artifact_anchor_for_transition(next_role, previous)?.to_string(),
         false,
+        false,
     ))
+}
+
+fn next_recovery_anchor(
+    next_role: WorkflowRole,
+    previous: &ProjectCheckpoint,
+    consumed_recovery_anchor: bool,
+) -> Option<String> {
+    if next_role == WorkflowRole::Execution || !consumed_recovery_anchor {
+        previous.recovery_anchor.clone()
+    } else {
+        None
+    }
 }
 
 fn artifact_anchor_for_transition(
@@ -1934,11 +1961,12 @@ mod tests {
             ),
             "E1".to_string(),
         );
-        let (fenced_prepare, consumed) =
+        let (fenced_prepare, consumed, consumed_recovery) =
             gpt_transition_anchor(WorkflowRole::Prepare, &historical_execution, Some("S1"))
                 .unwrap();
         assert_eq!(fenced_prepare, "S1");
         assert!(consumed);
+        assert!(!consumed_recovery);
 
         let fresh_prepare = completed_artifact(
             &running(WorkflowRole::Prepare),
@@ -1946,10 +1974,11 @@ mod tests {
             WorkflowRole::Qa,
             "P3".to_string(),
         );
-        let (qa_baseline, consumed) =
+        let (qa_baseline, consumed, consumed_recovery) =
             gpt_transition_anchor(WorkflowRole::Qa, &fresh_prepare, None).unwrap();
         assert_eq!(qa_baseline, "P3");
         assert!(!consumed);
+        assert!(!consumed_recovery);
     }
 
     #[test]
@@ -2088,5 +2117,111 @@ mod tests {
             artifact_anchor_for_transition(WorkflowRole::Prepare, &state).unwrap(),
             "settings-head"
         );
+    }
+
+    #[test]
+    fn recovery_anchor_survives_execution_until_prepare_consumes_it() {
+        let mut prepare = running(WorkflowRole::Prepare);
+        prepare.status = TrackerStatus::Completed;
+        prepare.next_role = Some(WorkflowRole::Execution);
+        prepare.last_artifact_commit = None;
+        prepare.recovery_anchor = Some("R1".to_string());
+        let execution_anchor = next_recovery_anchor(WorkflowRole::Execution, &prepare, false);
+        assert_eq!(execution_anchor.as_deref(), Some("R1"));
+
+        let mut execution = prepare.clone();
+        execution.current_role = WorkflowRole::Execution;
+        execution.status = TrackerStatus::Running;
+        execution.next_role = None;
+        execution.recovery_anchor = execution_anchor;
+        let automatic = completed_execution(&execution, "E1".to_string());
+        let manual = manually_completed_execution(&execution, 1);
+        assert_eq!(automatic.recovery_anchor.as_deref(), Some("R1"));
+        assert_eq!(manual.recovery_anchor.as_deref(), Some("R1"));
+
+        let (baseline, _, consumed_recovery) =
+            gpt_transition_anchor(WorkflowRole::Prepare, &automatic, None).unwrap();
+        assert_eq!(baseline, "R1");
+        assert!(consumed_recovery);
+        assert_eq!(
+            next_recovery_anchor(WorkflowRole::Prepare, &automatic, consumed_recovery),
+            None
+        );
+    }
+
+    #[test]
+    fn startup_recovery_anchor_outranks_stale_artifact_history() {
+        let fixture = TempGitWorkflow::new();
+        let p0_path = "noctua/prepare/20261002-150000-p0-qa-handoff.md";
+        let p0 = fixture.commit_gpt(p0_path);
+        fixture.commit_gpt("noctua/qa/20261002-150100-q0-qa-report.md");
+        let r1 = fixture.commit_gpt("recovery/20261002-150200-r1.md");
+        let repository = fixture.gpt_repository();
+        let head = fetch_and_head(&repository).unwrap();
+        let mut persisted = completed_artifact(
+            &running(WorkflowRole::Prepare),
+            artifact(p0_path, &p0),
+            WorkflowRole::Qa,
+            p0,
+        );
+        persisted.recovery_anchor = Some(r1);
+        let recovered = startup_state_fold(
+            ProjectId::Noctua,
+            Some(&persisted),
+            &fixture.config,
+            &repository,
+            &head,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.current_role, WorkflowRole::Prepare);
+        assert_eq!(
+            recovered.recovery_anchor.as_deref(),
+            persisted.recovery_anchor.as_deref()
+        );
+        assert_eq!(
+            recovered.last_artifact_commit,
+            persisted.last_artifact_commit
+        );
+    }
+
+    #[test]
+    fn fresh_artifact_supersedes_recovery_anchor() {
+        let fixture = TempGitWorkflow::new();
+        let r1 = fixture.commit_gpt("recovery/20261002-150000-r1.md");
+        let p2_path = "noctua/prepare/20261002-150100-p2-qa-handoff.md";
+        let p2 = fixture.commit_gpt(p2_path);
+        let repository = fixture.gpt_repository();
+        let head = fetch_and_head(&repository).unwrap();
+        let mut state = running(WorkflowRole::Prepare);
+        state.status = TrackerStatus::Completed;
+        state.next_role = Some(WorkflowRole::Execution);
+        state.last_artifact_commit = None;
+        state.recovery_anchor = Some(r1);
+        let refreshed =
+            refresh_pending_completed_at(ProjectId::Noctua, &state, &repository, &head, None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(refreshed.last_artifact_commit.as_deref(), Some(p2.as_str()));
+        assert_eq!(refreshed.recovery_anchor, None);
+    }
+
+    #[test]
+    fn startup_fence_precedes_recovery_anchor_before_artifact_anchor() {
+        let mut state = running(WorkflowRole::Qa);
+        state.status = TrackerStatus::Completed;
+        state.next_role = Some(WorkflowRole::Prepare);
+        state.last_artifact_commit = Some("P0".to_string());
+        state.recovery_anchor = Some("R1".to_string());
+        let (first, consumes_fence, consumes_recovery) =
+            gpt_transition_anchor(WorkflowRole::Prepare, &state, Some("S1")).unwrap();
+        assert_eq!(first, "S1");
+        assert!(consumes_fence);
+        assert!(!consumes_recovery);
+        let (second, consumes_fence, consumes_recovery) =
+            gpt_transition_anchor(WorkflowRole::Prepare, &state, None).unwrap();
+        assert_eq!(second, "R1");
+        assert!(!consumes_fence);
+        assert!(consumes_recovery);
     }
 }
