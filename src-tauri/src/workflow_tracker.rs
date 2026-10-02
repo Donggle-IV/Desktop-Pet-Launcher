@@ -1418,6 +1418,113 @@ fn select_bootstrap(candidates: Vec<BootstrapEvidence>) -> Option<BootstrapEvide
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempGitWorkflow {
+        root: PathBuf,
+        gpt: PathBuf,
+        config: TrackerConfigFile,
+    }
+
+    impl TempGitWorkflow {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "iseol-workflow-tracker-{}-{}",
+                std::process::id(),
+                TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let gpt = setup_remote_clone(&root, "gpt");
+            let target = setup_remote_clone(&root, "target");
+            Self {
+                config: TrackerConfigFile {
+                    gpt_prompt_path: Some(gpt.clone()),
+                    noctua_path: target.clone(),
+                    noctua_branch: "master".to_string(),
+                    fgo_path: target.clone(),
+                    fgo_branch: "master".to_string(),
+                },
+                root,
+                gpt,
+            }
+        }
+
+        fn gpt_repository(&self) -> GitRepository {
+            GitRepository {
+                path: self.gpt.clone(),
+                branch: "master".to_string(),
+            }
+        }
+
+        fn commit_gpt(&self, path: &str) -> String {
+            let file = self.gpt.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, path).unwrap();
+            git(&self.gpt, &["add", "."]);
+            git(&self.gpt, &["commit", "-m", path]);
+            git(&self.gpt, &["push", "origin", "master"]);
+            git_output(&self.gpt, &["rev-parse", "HEAD"])
+        }
+    }
+
+    impl Drop for TempGitWorkflow {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn setup_remote_clone(root: &Path, name: &str) -> PathBuf {
+        let remote = root.join(format!("{name}.git"));
+        let work = root.join(name);
+        git(
+            root,
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=master",
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(
+            root,
+            &["clone", remote.to_str().unwrap(), work.to_str().unwrap()],
+        );
+        git(&work, &["config", "user.email", "test@example.invalid"]);
+        git(&work, &["config", "user.name", "test"]);
+        fs::write(work.join("README.md"), "test").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "initial"]);
+        git(&work, &["push", "-u", "origin", "master"]);
+        work
+    }
+
+    fn git(directory: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(directory: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
 
     #[test]
     fn prepare_suffixes_define_the_next_role() {
@@ -1866,5 +1973,120 @@ mod tests {
             serde_json::from_str(r#"{"currentRole":"qa","status":"completed"}"#).unwrap();
         assert_eq!(checkpoint.last_artifact_commit, None);
         assert_eq!(checkpoint.status, TrackerStatus::Completed);
+    }
+
+    #[test]
+    fn startup_fold_consumes_pending_refresh_and_qa_without_replay() {
+        let fixture = TempGitWorkflow::new();
+        let p1_path = "noctua/prepare/20261002-150000-p1-execution-handoff.md";
+        let p1 = fixture.commit_gpt(p1_path);
+        fixture.commit_gpt("noctua/prepare/20261002-150100-p2-qa-handoff.md");
+        let q1 = fixture.commit_gpt("noctua/qa/20261002-150200-q1-qa-report.md");
+        let repository = fixture.gpt_repository();
+        let head = fetch_and_head(&repository).unwrap();
+        let persisted = completed_artifact(
+            &running(WorkflowRole::Prepare),
+            artifact(p1_path, &p1),
+            WorkflowRole::Execution,
+            p1,
+        );
+        let recovered = startup_state_fold(
+            ProjectId::Noctua,
+            Some(&persisted),
+            &fixture.config,
+            &repository,
+            &head,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.current_role, WorkflowRole::Qa);
+        assert_eq!(recovered.status, TrackerStatus::Completed);
+        assert_eq!(recovered.last_artifact_commit.as_deref(), Some(q1.as_str()));
+        assert!(refresh_pending_completed_at(
+            ProjectId::Noctua,
+            &recovered,
+            &repository,
+            &head,
+            Some(&head),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn startup_fold_reaches_more_than_three_causal_transitions() {
+        let fixture = TempGitWorkflow::new();
+        let p1_path = "noctua/prepare/20261002-150000-p1-qa-handoff.md";
+        let p1 = fixture.commit_gpt(p1_path);
+        fixture.commit_gpt("noctua/qa/20261002-150100-q1-qa-report.md");
+        fixture.commit_gpt("noctua/prepare/20261002-150200-p2-qa-handoff.md");
+        fixture.commit_gpt("noctua/qa/20261002-150300-q2-qa-report.md");
+        fixture.commit_gpt("noctua/prepare/20261002-150400-p3-qa-handoff.md");
+        fixture.commit_gpt("noctua/qa/20261002-150500-q3-qa-report.md");
+        let p4 = fixture.commit_gpt("noctua/prepare/20261002-150600-p4-qa-handoff.md");
+        let repository = fixture.gpt_repository();
+        let head = fetch_and_head(&repository).unwrap();
+        let persisted = completed_artifact(
+            &running(WorkflowRole::Prepare),
+            artifact(p1_path, &p1),
+            WorkflowRole::Qa,
+            p1,
+        );
+        let recovered = startup_state_fold(
+            ProjectId::Noctua,
+            Some(&persisted),
+            &fixture.config,
+            &repository,
+            &head,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered.current_role, WorkflowRole::Prepare);
+        assert_eq!(recovered.next_role, Some(WorkflowRole::Qa));
+        assert_eq!(recovered.last_artifact_commit.as_deref(), Some(p4.as_str()));
+    }
+
+    #[test]
+    fn ambiguous_startup_history_is_not_consumed() {
+        let fixture = TempGitWorkflow::new();
+        let p1_path = "noctua/prepare/20261002-150000-p1-qa-handoff.md";
+        let p1 = fixture.commit_gpt(p1_path);
+        let first = fixture.gpt.join("noctua/qa/first-qa-report.md");
+        let second = fixture.gpt.join("noctua/qa/second-qa-report.md");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(first, "first").unwrap();
+        fs::write(second, "second").unwrap();
+        git(&fixture.gpt, &["add", "."]);
+        git(&fixture.gpt, &["commit", "-m", "ambiguous reports"]);
+        git(&fixture.gpt, &["push", "origin", "master"]);
+        let repository = fixture.gpt_repository();
+        let head = fetch_and_head(&repository).unwrap();
+        let persisted = completed_artifact(
+            &running(WorkflowRole::Prepare),
+            artifact(p1_path, &p1),
+            WorkflowRole::Qa,
+            p1,
+        );
+        assert!(startup_state_fold(
+            ProjectId::Noctua,
+            Some(&persisted),
+            &fixture.config,
+            &repository,
+            &head,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn settings_recovery_anchor_is_a_valid_transition_cursor() {
+        let mut state = running(WorkflowRole::Qa);
+        state.status = TrackerStatus::Completed;
+        state.next_role = Some(WorkflowRole::Prepare);
+        state.last_artifact_commit = None;
+        state.recovery_anchor = Some("settings-head".to_string());
+        assert_eq!(
+            artifact_anchor_for_transition(WorkflowRole::Prepare, &state).unwrap(),
+            "settings-head"
+        );
     }
 }
