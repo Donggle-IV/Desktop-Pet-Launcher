@@ -100,7 +100,7 @@ pub(crate) struct WorkflowTracker {
 }
 
 impl WorkflowTracker {
-    pub(crate) fn initialize(&self, app_data: PathBuf, queue: &QueueRuntime) -> Result<(), String> {
+    pub(crate) fn initialize(&self, app_data: PathBuf) -> Result<(), String> {
         fs::create_dir_all(&app_data).map_err(|error| error.to_string())?;
         let paths = TrackerPaths {
             config: app_data.join(CONFIG_FILE),
@@ -108,9 +108,6 @@ impl WorkflowTracker {
         };
         let config = load_or_create_config(&paths.config)?;
         let checkpoint = load_checkpoint(&paths.checkpoint)?;
-        for (project, state) in states(&checkpoint) {
-            queue.restore(project, queue_input(state));
-        }
         let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
         inner.paths = Some(paths);
         inner.config = Some(config);
@@ -118,34 +115,36 @@ impl WorkflowTracker {
         Ok(())
     }
 
-    pub(crate) fn bootstrap(&self, queue: &QueueRuntime) -> Result<Vec<QueueMutation>, String> {
+    pub(crate) fn startup_reconcile(&self, queue: &QueueRuntime) -> Vec<QueueMutation> {
         let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
         let Some(config) = inner.config.clone() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
-        let Some(path) = config.gpt_prompt_path.clone() else {
-            return Ok(Vec::new());
-        };
-        let repository = GitRepository {
-            path,
-            branch: "main".to_string(),
-        };
-        fetch_and_head(&repository)?;
         let mut mutations = Vec::new();
         for project in [ProjectId::Noctua, ProjectId::Fgo] {
-            if state_for(&inner.checkpoint, project).is_some() {
-                continue;
-            }
-            if let Some(state) =
-                bootstrap_state(&repository, &project_repository(project, &config), project)?
-            {
-                set_state(&mut inner.checkpoint, project, Some(state.clone()));
-                let mutation = queue.restore(project, queue_input(&state));
-                mutations.push(mutation);
+            let persisted = state_for(&inner.checkpoint, project).cloned();
+            match startup_state_for(project, persisted.as_ref(), &config) {
+                Ok(Some(state)) => {
+                    set_state(&mut inner.checkpoint, project, Some(state.clone()));
+                    mutations.push(queue.restore(project, queue_input(&state)));
+                }
+                Ok(None) => {
+                    if let Some(state) = persisted {
+                        mutations.push(queue.restore(project, queue_input(&state)));
+                    }
+                }
+                Err(error) => {
+                    eprintln!("workflow tracker startup reconciliation for {project:?} retained its state: {error}");
+                    if let Some(state) = persisted {
+                        mutations.push(queue.restore(project, queue_input(&state)));
+                    }
+                }
             }
         }
-        persist(&inner)?;
-        Ok(mutations)
+        if let Err(error) = persist(&inner) {
+            eprintln!("workflow tracker checkpoint write failed: {error}");
+        }
+        mutations
     }
 
     pub(crate) fn reconcile(&self, queue: &QueueRuntime) -> Vec<QueueMutation> {
@@ -300,6 +299,83 @@ impl WorkflowTracker {
         persist(&inner)?;
         Ok(queue.restore(project, queue_input(&next)))
     }
+}
+
+fn startup_state_for(
+    project: ProjectId,
+    persisted: Option<&ProjectCheckpoint>,
+    config: &TrackerConfigFile,
+) -> Result<Option<ProjectCheckpoint>, String> {
+    match persisted {
+        None => latest_completed_state(project, config),
+        Some(state) if state.status == TrackerStatus::Running => {
+            Ok(completion_for(project, state, config)?.or_else(|| Some(state.clone())))
+        }
+        Some(state) => reconcile_completed_startup(project, state, config),
+    }
+}
+
+fn reconcile_completed_startup(
+    project: ProjectId,
+    persisted: &ProjectCheckpoint,
+    config: &TrackerConfigFile,
+) -> Result<Option<ProjectCheckpoint>, String> {
+    let persisted_timestamp = completed_timestamp(project, persisted, config)?;
+    let Some(current) = latest_completed_evidence(project, config)? else {
+        eprintln!("workflow tracker startup reconciliation for {project:?} found ambiguous completion evidence");
+        return Ok(Some(persisted.clone()));
+    };
+    Ok(Some(newer_completed_state(
+        persisted,
+        persisted_timestamp,
+        current,
+    )))
+}
+
+fn newer_completed_state(
+    persisted: &ProjectCheckpoint,
+    persisted_timestamp: u64,
+    current: BootstrapEvidence,
+) -> ProjectCheckpoint {
+    if current.evidence_timestamp > persisted_timestamp {
+        current.state()
+    } else {
+        persisted.clone()
+    }
+}
+
+fn completed_timestamp(
+    project: ProjectId,
+    state: &ProjectCheckpoint,
+    config: &TrackerConfigFile,
+) -> Result<u64, String> {
+    match state.current_role {
+        WorkflowRole::Prepare | WorkflowRole::Qa => {
+            let commit = state.last_artifact_commit.as_deref().ok_or_else(|| {
+                "completed gpt_prompt workflow has no artifact commit identity; use Settings alignment"
+                    .to_string()
+            })?;
+            let repository = gpt_prompt_repository(config)?;
+            fetch_and_head(&repository)?;
+            commit_timestamp(&repository, commit)
+        }
+        WorkflowRole::Execution => {
+            let commit = state.last_observed_sha.as_deref().ok_or_else(|| {
+                "completed Execution workflow has no observed commit identity; use Settings alignment"
+                    .to_string()
+            })?;
+            let repository = project_repository(project, config);
+            fetch_and_head(&repository)?;
+            commit_timestamp(&repository, commit)
+        }
+    }
+}
+
+fn latest_completed_state(
+    project: ProjectId,
+    config: &TrackerConfigFile,
+) -> Result<Option<ProjectCheckpoint>, String> {
+    Ok(latest_completed_evidence(project, config)?.map(BootstrapEvidence::state))
 }
 
 fn completion_for(
@@ -467,6 +543,16 @@ fn project_repository(project: ProjectId, config: &TrackerConfigFile) -> GitRepo
     }
 }
 
+fn gpt_prompt_repository(config: &TrackerConfigFile) -> Result<GitRepository, String> {
+    Ok(GitRepository {
+        path: config
+            .gpt_prompt_path
+            .clone()
+            .ok_or_else(|| "gpt_prompt checkout is not configured".to_string())?,
+        branch: "main".to_string(),
+    })
+}
+
 fn prepare_directory(project: ProjectId) -> &'static str {
     match project {
         ProjectId::Noctua => "noctua/prepare/",
@@ -551,17 +637,6 @@ fn queue_input(state: &ProjectCheckpoint) -> ProjectStateInput {
         label: state.label.clone(),
         attention_required: Some(false),
     }
-}
-
-fn states(checkpoint: &TrackerCheckpointFile) -> Vec<(ProjectId, &ProjectCheckpoint)> {
-    let mut states = Vec::new();
-    if let Some(state) = checkpoint.noctua.as_ref() {
-        states.push((ProjectId::Noctua, state));
-    }
-    if let Some(state) = checkpoint.fgo.as_ref() {
-        states.push((ProjectId::Fgo, state));
-    }
-    states
 }
 
 fn state_for(checkpoint: &TrackerCheckpointFile, project: ProjectId) -> Option<&ProjectCheckpoint> {
@@ -651,13 +726,15 @@ impl BootstrapEvidence {
     }
 }
 
-fn bootstrap_state(
-    gpt_prompt: &GitRepository,
-    target: &GitRepository,
+fn latest_completed_evidence(
     project: ProjectId,
-) -> Result<Option<ProjectCheckpoint>, String> {
+    config: &TrackerConfigFile,
+) -> Result<Option<BootstrapEvidence>, String> {
+    let gpt_prompt = gpt_prompt_repository(config)?;
+    fetch_and_head(&gpt_prompt)?;
+    let target = project_repository(project, config);
     let prepare = newest_current_artifact(
-        gpt_prompt,
+        &gpt_prompt,
         prepare_directory(project),
         &[
             "-execution-handoff.md",
@@ -666,7 +743,7 @@ fn bootstrap_state(
         ],
     )?;
     let qa = newest_current_artifact(
-        gpt_prompt,
+        &gpt_prompt,
         qa_directory(project),
         &["-qa-report.md", "-reqa-report.md"],
     )?;
@@ -677,7 +754,7 @@ fn bootstrap_state(
                 role: WorkflowRole::Prepare,
                 next_role,
                 evidence_sha: artifact.commit.clone(),
-                evidence_timestamp: commit_timestamp(gpt_prompt, &artifact.commit)?,
+                evidence_timestamp: commit_timestamp(&gpt_prompt, &artifact.commit)?,
                 artifact: Some(artifact),
             });
         }
@@ -687,11 +764,11 @@ fn bootstrap_state(
             role: WorkflowRole::Qa,
             next_role: WorkflowRole::Prepare,
             evidence_sha: artifact.commit.clone(),
-            evidence_timestamp: commit_timestamp(gpt_prompt, &artifact.commit)?,
+            evidence_timestamp: commit_timestamp(&gpt_prompt, &artifact.commit)?,
             artifact: Some(artifact),
         });
     }
-    let (execution_head, execution_timestamp) = fetch_head_with_timestamp(target)?;
+    let (execution_head, execution_timestamp) = fetch_head_with_timestamp(&target)?;
     let execution_anchor = candidates
         .iter()
         .filter(|candidate| {
@@ -708,7 +785,7 @@ fn bootstrap_state(
         evidence_timestamp: execution_timestamp,
         artifact: execution_anchor,
     });
-    Ok(select_bootstrap(candidates).map(BootstrapEvidence::state))
+    Ok(select_bootstrap(candidates))
 }
 
 fn select_bootstrap(candidates: Vec<BootstrapEvidence>) -> Option<BootstrapEvidence> {
@@ -967,6 +1044,46 @@ mod tests {
         assert_eq!(state.current_role, WorkflowRole::Execution);
         assert_eq!(state.last_artifact_commit.as_deref(), Some("P1"));
         assert_eq!(state.label.as_deref(), Some("P1"));
+    }
+
+    #[test]
+    fn startup_completed_checkpoint_catches_up_only_to_newer_unique_evidence() {
+        let persisted = completed_artifact(
+            &running(WorkflowRole::Prepare),
+            artifact("noctua/prepare/p1-execution-handoff.md", "P1"),
+            WorkflowRole::Execution,
+            "P1".to_string(),
+        );
+        let execution = BootstrapEvidence {
+            role: WorkflowRole::Execution,
+            next_role: WorkflowRole::Prepare,
+            evidence_sha: "E2".to_string(),
+            evidence_timestamp: 20,
+            artifact: Some(artifact("noctua/prepare/p1-execution-handoff.md", "P1")),
+        };
+        assert_eq!(
+            newer_completed_state(&persisted, 10, execution).current_role,
+            WorkflowRole::Execution
+        );
+        assert_eq!(
+            newer_completed_state(&persisted, 20, evidence(WorkflowRole::Qa, 20)).current_role,
+            WorkflowRole::Prepare
+        );
+    }
+
+    #[test]
+    fn startup_recovery_restore_does_not_emit_completion() {
+        let queue = QueueRuntime::default();
+        let completed = completed_artifact(
+            &running(WorkflowRole::Qa),
+            artifact("fgo/qa/q1-qa-report.md", "Q1"),
+            WorkflowRole::Prepare,
+            "head".to_string(),
+        );
+        assert!(queue
+            .restore(ProjectId::Fgo, queue_input(&completed))
+            .completed
+            .is_none());
     }
 
     #[test]

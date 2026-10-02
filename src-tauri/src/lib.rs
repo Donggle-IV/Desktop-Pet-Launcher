@@ -609,10 +609,10 @@ pub fn run() {
             let tracker = (*app.state::<WorkflowTracker>()).clone();
             let queue = (*app.state::<QueueRuntime>()).clone();
             match app.handle().path().app_data_dir() {
-                Ok(path) => match tracker.initialize(path, &queue) {
+                Ok(path) => match tracker.initialize(path) {
                     Ok(()) => {
-                        if let Err(error) = tracker.bootstrap(&queue) {
-                            eprintln!("workflow tracker bootstrap disabled: {error}");
+                        for mutation in tracker.startup_reconcile(&queue) {
+                            queue_bridge::emit_mutation(app.handle(), mutation);
                         }
                         start_workflow_tracker(app.handle().clone(), tracker, queue);
                     }
