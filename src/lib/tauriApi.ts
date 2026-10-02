@@ -6,6 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import packageInfo from "../../package.json";
 import type { AppSettings } from "./settings";
 import type { PetPackage } from "./petContract";
+import type { QueueProjection } from "./queueContract";
 
 const UPDATE_MANIFEST_URL = "https://pet.nether.top/latest.json";
 const LATEST_RELEASE_API_URL =
@@ -101,6 +102,13 @@ export async function listPetPackages(petFolders: string[] = []): Promise<PetPac
     return [];
   }
   return invoke<PetPackage[]>("list_pet_packages", { extraRoots: petFolders });
+}
+
+export async function getQueueState(): Promise<QueueProjection> {
+  if (!isTauriRuntime()) {
+    return { revision: 0, noctua: null, fgo: null };
+  }
+  return invoke<QueueProjection>("get_queue_state");
 }
 
 export async function showSettingsWindow(): Promise<void> {

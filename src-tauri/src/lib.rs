@@ -13,6 +13,10 @@ use tauri::{
 
 mod network;
 use network::NetworkState;
+mod queue_bridge;
+mod queue_state;
+use queue_bridge::QueueBridge;
+use queue_state::{QueueProjection, QueueRuntime};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -482,9 +486,17 @@ async fn send_llm_chat(
         .ok_or_else(|| "모델 응답에서 답변 텍스트를 찾지 못했습니다".to_string())
 }
 
+#[tauri::command]
+fn get_queue_state(queue: tauri::State<'_, QueueRuntime>) -> QueueProjection {
+    queue.projection()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
+    let queue_runtime = QueueRuntime::default();
+    let queue_bridge = QueueBridge::default();
+    let queue_bridge_shutdown = queue_bridge.clone();
 
     #[cfg(desktop)]
     {
@@ -498,6 +510,8 @@ pub fn run() {
 
     builder
         .manage(NetworkState::new().expect("failed to create HTTP client"))
+        .manage(queue_runtime)
+        .manage(queue_bridge)
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -519,14 +533,22 @@ pub fn run() {
             reveal_pet_folder,
             import_pet_from_url,
             send_llm_chat,
+            get_queue_state,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;
             let _ = restore_pet_window_from_disk(app.handle());
+            let bridge = (*app.state::<QueueBridge>()).clone();
+            let queue = (*app.state::<QueueRuntime>()).clone();
+            if let Err(error) = bridge.start(app.handle().clone(), queue) {
+                eprintln!("queue bridge disabled: {error}");
+            }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running desktop pet launcher");
+        .build(tauri::generate_context!())
+        .expect("error while building desktop pet launcher")
+        .run(|_, _| {});
+    queue_bridge_shutdown.shutdown();
 }
 
 fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {

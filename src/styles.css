@@ -49,12 +49,94 @@ button {
   flex-direction: row-reverse;
 }
 
+.pet-column {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: stretch;
+}
+
 .pet-stage {
   position: relative;
   display: grid;
   flex: 0 0 auto;
   margin-top: var(--pet-offset-y, 0);
   place-items: center;
+}
+
+.queue-panel {
+  display: grid;
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  min-height: 70px;
+  gap: 3px;
+  padding: 5px 7px 6px;
+  color: #e8eee9;
+  background: rgba(23, 32, 29, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 10px;
+  box-shadow: 0 10px 24px rgba(23, 22, 21, 0.18);
+  pointer-events: auto;
+}
+
+.queue-row {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) auto;
+  column-gap: 5px;
+  align-items: center;
+  min-width: 0;
+  font-size: 9px;
+  line-height: 1.1;
+}
+
+.queue-row strong {
+  overflow: hidden;
+  color: #fffaf2;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-status {
+  min-width: 0;
+  overflow: hidden;
+  color: #b9dcca;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-row.is-waiting .queue-status,
+.queue-row.is-blocked .queue-status {
+  color: #f3c977;
+}
+
+.queue-row.is-failed .queue-status {
+  color: #f38d7d;
+}
+
+.queue-row.is-unknown .queue-status {
+  color: #aeb8b2;
+}
+
+.queue-role {
+  grid-column: 2 / -1;
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(232, 238, 233, 0.72);
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-label {
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(232, 238, 233, 0.9);
+  font-size: 8px;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pet-loading {

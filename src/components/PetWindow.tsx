@@ -24,6 +24,7 @@ import {
   captureCurrentWindowPosition,
   captureCursorPosition,
   currentWindowWorkArea,
+  getQueueState,
   isTauriRuntime,
   listPetPackages,
   moveCurrentWindowTo,
@@ -40,6 +41,13 @@ import {
 } from "../lib/tauriApi";
 import { usePetAnimation } from "../lib/usePetAnimation";
 import { DEFAULT_PALETTE, extractPetPalette, type PetPalette } from "../lib/petPalette";
+import { QueuePanel } from "./QueuePanel";
+import {
+  EMPTY_QUEUE_PROJECTION,
+  type QueueProjectCompletedEvent,
+  type QueueProjection,
+} from "../lib/queueContract";
+import { resolveVisualState } from "../lib/resolveVisualState";
 import {
   applyPetDragMovement,
   createPetDragState,
@@ -52,6 +60,7 @@ type ChatSide = "left" | "right";
 const CHAT_BUTTON_SIZE = 34;
 const CHAT_BUTTON_INSET = 2;
 const CHAT_HOTSPOT_PADDING = 14;
+const QUEUE_PANEL_HEIGHT = 70;
 
 interface WindowOffset {
   x: number;
@@ -71,6 +80,8 @@ export function PetWindow() {
   const [ready, setReady] = useState(false);
   const [dragState, setDragState] = useState<"running-left" | "running-right" | null>(null);
   const [idleVariant, setIdleVariant] = useState<AppSettings["manualState"]>("idle");
+  const [queueProjection, setQueueProjection] = useState<QueueProjection>(EMPTY_QUEUE_PROJECTION);
+  const [completionAcknowledgement, setCompletionAcknowledgement] = useState<number | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatDraft, setChatDraft] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -87,6 +98,7 @@ export function PetWindow() {
   const positionSaveTimerRef = useRef<number | null>(null);
   const positionSaveEnabledAtRef = useRef(0);
   const dragRef = useRef<PetDragState | null>(null);
+  const queueRevisionRef = useRef(0);
 
   const refreshPackages = useCallback(async (petFolders: string[] = []) => {
     const found = await listPetPackages(petFolders);
@@ -117,6 +129,7 @@ export function PetWindow() {
         await saveSettings(nextSettings);
       }
       await setCurrentWindowGeometry(nextSettings);
+      await setCurrentWindowSize(nextSettings.width, nextSettings.height + QUEUE_PANEL_HEIGHT);
       positionSaveEnabledAtRef.current = Date.now() + 1500;
       setReady(true);
     }
@@ -125,6 +138,50 @@ export function PetWindow() {
       cancelled = true;
     };
   }, [refreshPackages]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return;
+    }
+    const applyProjection = (next: QueueProjection) => {
+      if (next.revision > queueRevisionRef.current) {
+        queueRevisionRef.current = next.revision;
+        setQueueProjection(next);
+      }
+    };
+    const unlisteners: Array<() => void> = [];
+    let cancelled = false;
+    Promise.all([
+      getCurrentWindow().listen<QueueProjection>("queue-state-updated", (event) =>
+        applyProjection(event.payload),
+      ),
+      getCurrentWindow().listen<QueueProjectCompletedEvent>("queue-project-completed", (event) => {
+        if (event.payload.revision >= queueRevisionRef.current) {
+          setCompletionAcknowledgement(event.payload.revision);
+        }
+      }),
+    ])
+      .then((listeners) => {
+        unlisteners.push(...listeners);
+        if (!cancelled) {
+          void getQueueState().then(applyProjection).catch(() => undefined);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (completionAcknowledgement === null) {
+      return;
+    }
+    const duration = STATE_DEFINITIONS.waving.durations.reduce((total, value) => total + value, 0);
+    const timer = window.setTimeout(() => setCompletionAcknowledgement(null), duration);
+    return () => window.clearTimeout(timer);
+  }, [completionAcknowledgement]);
 
   useEffect(() => {
     if (!settings.idleVariety || settings.reducedMotion || settings.manualState !== "idle") {
@@ -196,7 +253,9 @@ export function PetWindow() {
   const chatGap = 12;
   const getTargetRenderSize = (expanded: boolean) => ({
     width: settings.width + (expanded ? chatPanelWidth + chatGap : 0),
-    height: expanded ? Math.max(settings.height, 330) : settings.height,
+    height: expanded
+      ? Math.max(settings.height + QUEUE_PANEL_HEIGHT, 330)
+      : settings.height + QUEUE_PANEL_HEIGHT,
   });
   const renderSize = useMemo(
     () => getTargetRenderSize(chatExpanded),
@@ -232,8 +291,14 @@ export function PetWindow() {
         : null,
     [chatDraft, chatMessages, chatOpen, chatPhase, settings.llmChatEnabled],
   );
-  const visualState =
-    dragState ?? conversationState ?? (settings.manualState === "idle" ? idleVariant : settings.manualState);
+  const visualState = resolveVisualState({
+    dragState,
+    conversationState,
+    manualState: settings.manualState,
+    completionAcknowledgement: completionAcknowledgement !== null,
+    queue: queueProjection,
+    idleVariant,
+  });
   const frame = usePetAnimation(visualState, settings.animationSpeed, settings.reducedMotion);
   const spriteFrameTransform = getSpriteFrameTransform(
     visualState,
@@ -476,7 +541,7 @@ export function PetWindow() {
     petAnchorRef.current = anchor;
     windowOffsetRef.current = { x: 0, y: 0 };
     setPetOffsetY(0);
-    await setCurrentWindowFrame(settings.width, settings.height, anchor.x, anchor.y);
+    await setCurrentWindowFrame(settings.width, settings.height + QUEUE_PANEL_HEIGHT, anchor.x, anchor.y);
   }
 
   async function chooseChatSide(): Promise<ChatSide> {
@@ -571,10 +636,10 @@ export function PetWindow() {
       windowOffsetRef.current = { x: 0, y: 0 };
       setPetOffsetY(0);
       if (!anchor) {
-        await setCurrentWindowSize(settings.width, settings.height);
+        await setCurrentWindowSize(settings.width, settings.height + QUEUE_PANEL_HEIGHT);
         return;
       }
-      await setCurrentWindowFrame(settings.width, settings.height, anchor.x, anchor.y);
+      await setCurrentWindowFrame(settings.width, settings.height + QUEUE_PANEL_HEIGHT, anchor.x, anchor.y);
       return;
     }
 
@@ -670,6 +735,7 @@ export function PetWindow() {
       return;
     }
     if (result.direction !== drag.lastDirection) {
+      drag.lastDirection = result.direction;
       setDragState(result.direction);
     }
     petAnchorRef.current = result.petAnchor;
@@ -731,15 +797,16 @@ export function PetWindow() {
       style={shellStyle}
       onContextMenu={(event) => event.preventDefault()}
     >
-      <section
-        className="pet-stage"
-        style={{ width: settings.width, height: settings.height }}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerUp}
-        onDoubleClick={() => showSettingsWindow()}
-      >
+      <div className="pet-column" style={{ width: settings.width }}>
+        <section
+          className="pet-stage"
+          style={{ width: settings.width, height: settings.height }}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerUp}
+          onDoubleClick={() => showSettingsWindow()}
+        >
         {sprite && activePet ? (
           <div
             className={`pet-sprite ${pixelated ? "is-pixelated" : ""}`}
@@ -788,7 +855,9 @@ export function PetWindow() {
             <MessageCircle size={18} />
           </button>
         ) : null}
-      </section>
+        </section>
+        <QueuePanel projection={queueProjection} />
+      </div>
 
       {chatExpanded ? (
         <section

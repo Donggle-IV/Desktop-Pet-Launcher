@@ -47,7 +47,6 @@ export function applyPetDragMovement(
   }
   drag.moved = true;
   const direction = drag.accumX < 0 ? "running-left" : "running-right";
-  drag.lastDirection = direction;
   return {
     petAnchor: {
       x: Math.round(drag.originX + drag.accumX),
