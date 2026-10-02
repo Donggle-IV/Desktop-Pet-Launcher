@@ -161,21 +161,30 @@ impl WorkflowTracker {
             let Some(current) = state_for(&inner.checkpoint, project).cloned() else {
                 continue;
             };
-            if current.status != TrackerStatus::Running {
-                continue;
-            }
-            match completion_for(project, &current, &config) {
-                Ok(Some(completed)) => {
-                    set_state(&mut inner.checkpoint, project, Some(completed.clone()));
-                    let mutation = queue
-                        .replace(project, queue_input(&completed))
-                        .expect("tracker state is valid");
-                    mutations.push(mutation);
+            match current.status {
+                TrackerStatus::Running => match completion_for(project, &current, &config) {
+                    Ok(Some(completed)) => {
+                        set_state(&mut inner.checkpoint, project, Some(completed.clone()));
+                        let mutation = queue
+                            .replace(project, queue_input(&completed))
+                            .expect("tracker state is valid");
+                        mutations.push(mutation);
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!(
+                        "workflow tracker reconciliation for {project:?} retained its state: {error}"
+                    ),
+                },
+                TrackerStatus::Completed => match refresh_pending_completed(project, &current, &config) {
+                    Ok(Some(refreshed)) => {
+                        set_state(&mut inner.checkpoint, project, Some(refreshed.clone()));
+                        mutations.push(queue.restore(project, queue_input(&refreshed)));
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!(
+                        "workflow tracker completed refresh for {project:?} retained its state: {error}"
+                    ),
                 }
-                Ok(None) => {}
-                Err(error) => eprintln!(
-                    "workflow tracker reconciliation for {project:?} retained its state: {error}"
-                ),
             }
         }
         if !mutations.is_empty() {
@@ -328,6 +337,47 @@ fn validate_manual_execution_completion(current: &ProjectCheckpoint) -> Result<(
         return Err("only a running Execution workflow may be manually completed".to_string());
     }
     Ok(())
+}
+
+fn refresh_pending_completed(
+    project: ProjectId,
+    current: &ProjectCheckpoint,
+    config: &TrackerConfigFile,
+) -> Result<Option<ProjectCheckpoint>, String> {
+    let (directory, suffixes) = match current.current_role {
+        WorkflowRole::Prepare => (
+            prepare_directory(project),
+            &[
+                "-execution-handoff.md",
+                "-qa-handoff.md",
+                "-reqa-handoff.md",
+            ] as &[_],
+        ),
+        WorkflowRole::Qa => (
+            qa_directory(project),
+            &["-qa-report.md", "-reqa-report.md"] as &[_],
+        ),
+        WorkflowRole::Execution => return Ok(None),
+    };
+    let baseline = current.last_artifact_commit.as_deref().ok_or_else(|| {
+        "completed artifact workflow has no artifact commit identity; use Settings alignment"
+            .to_string()
+    })?;
+    let repository = gpt_prompt_repository(config)?;
+    let head = fetch_and_head(&repository)?;
+    if !is_ancestor(&repository, baseline)? {
+        return Err("stored completed artifact anchor is no longer an ancestor of origin/main; use Settings alignment".to_string());
+    }
+    let Some(artifact) = newest_added_artifact(&repository, baseline, directory, suffixes)? else {
+        return Ok(None);
+    };
+    let next_role = match current.current_role {
+        WorkflowRole::Prepare => next_role_from_handoff(&artifact.path)
+            .ok_or_else(|| "unrecognized Prepare handoff suffix".to_string())?,
+        WorkflowRole::Qa => WorkflowRole::Prepare,
+        WorkflowRole::Execution => unreachable!(),
+    };
+    Ok(Some(completed_artifact(current, artifact, next_role, head)))
 }
 
 fn startup_state_for(
@@ -1212,6 +1262,61 @@ mod tests {
                 .manual_completed_at,
             None
         );
+    }
+
+    #[test]
+    fn pending_prepare_refresh_uses_the_latest_handoff_as_the_next_anchor() {
+        let p1 = completed_artifact(
+            &running(WorkflowRole::Prepare),
+            artifact("noctua/prepare/p1-execution-handoff.md", "P1"),
+            WorkflowRole::Execution,
+            "head-p1".to_string(),
+        );
+        let p2 = completed_artifact(
+            &p1,
+            artifact("noctua/prepare/p2-qa-handoff.md", "P2"),
+            WorkflowRole::Qa,
+            "head-p2".to_string(),
+        );
+        let p3 = completed_artifact(
+            &p2,
+            artifact("noctua/prepare/p3-execution-handoff.md", "P3"),
+            WorkflowRole::Execution,
+            "head-p3".to_string(),
+        );
+        assert_eq!(p2.status, TrackerStatus::Completed);
+        assert_eq!(p2.next_role, Some(WorkflowRole::Qa));
+        assert_eq!(p2.last_artifact_commit.as_deref(), Some("P2"));
+        assert_eq!(
+            artifact_anchor_for_transition(WorkflowRole::Qa, &p2).unwrap(),
+            "P2"
+        );
+        assert_eq!(p3.next_role, Some(WorkflowRole::Execution));
+        assert_eq!(p3.last_artifact_commit.as_deref(), Some("P3"));
+    }
+
+    #[test]
+    fn pending_qa_refresh_updates_without_a_new_completion_event() {
+        let q1 = completed_artifact(
+            &running(WorkflowRole::Qa),
+            artifact("fgo/qa/q1-qa-report.md", "Q1"),
+            WorkflowRole::Prepare,
+            "head-q1".to_string(),
+        );
+        let q2 = completed_artifact(
+            &q1,
+            artifact("fgo/qa/q2-reqa-report.md", "Q2"),
+            WorkflowRole::Prepare,
+            "head-q2".to_string(),
+        );
+        let queue = QueueRuntime::default();
+        queue.restore(ProjectId::Fgo, queue_input(&q1));
+        assert!(queue
+            .restore(ProjectId::Fgo, queue_input(&q2))
+            .completed
+            .is_none());
+        assert_eq!(q2.next_role, Some(WorkflowRole::Prepare));
+        assert_eq!(q2.last_artifact_commit.as_deref(), Some("Q2"));
     }
 
     #[test]
