@@ -1,5 +1,6 @@
 use crate::git_observer::{
-    commit_timestamp, fetch_and_head, newest_added_artifact, newest_current_artifact, GitRepository,
+    commit_timestamp, fetch_and_head, fetch_head_with_timestamp, is_ancestor,
+    newest_added_artifact, newest_current_artifact, GitArtifact, GitRepository,
 };
 use crate::queue_state::{
     InputStatus, ProjectId, ProjectStateInput, QueueMutation, QueueRuntime, WorkflowRole,
@@ -34,6 +35,8 @@ pub(crate) struct ProjectCheckpoint {
     pub(crate) baseline_source: Option<String>,
     #[serde(default)]
     pub(crate) last_artifact: Option<String>,
+    #[serde(default)]
+    pub(crate) last_artifact_commit: Option<String>,
     #[serde(default)]
     pub(crate) last_observed_sha: Option<String>,
 }
@@ -120,21 +123,22 @@ impl WorkflowTracker {
         let Some(config) = inner.config.clone() else {
             return Ok(Vec::new());
         };
-        if inner.checkpoint.noctua.is_some() || inner.checkpoint.fgo.is_some() {
-            return Ok(Vec::new());
-        }
-        let Some(path) = config.gpt_prompt_path else {
+        let Some(path) = config.gpt_prompt_path.clone() else {
             return Ok(Vec::new());
         };
         let repository = GitRepository {
             path,
             branch: "main".to_string(),
         };
-        let head = fetch_and_head(&repository)?;
+        fetch_and_head(&repository)?;
         let mut mutations = Vec::new();
         for project in [ProjectId::Noctua, ProjectId::Fgo] {
-            if let Some(found) = latest_bootstrap_artifact(&repository, project)? {
-                let state = found.state(head.clone());
+            if state_for(&inner.checkpoint, project).is_some() {
+                continue;
+            }
+            if let Some(state) =
+                bootstrap_state(&repository, &project_repository(project, &config), project)?
+            {
                 set_state(&mut inner.checkpoint, project, Some(state.clone()));
                 let mutation = queue.restore(project, queue_input(&state));
                 mutations.push(mutation);
@@ -157,12 +161,18 @@ impl WorkflowTracker {
             if current.status != TrackerStatus::Running {
                 continue;
             }
-            if let Ok(Some(completed)) = completion_for(project, &current, &config) {
-                set_state(&mut inner.checkpoint, project, Some(completed.clone()));
-                let mutation = queue
-                    .replace(project, queue_input(&completed))
-                    .expect("tracker state is valid");
-                mutations.push(mutation);
+            match completion_for(project, &current, &config) {
+                Ok(Some(completed)) => {
+                    set_state(&mut inner.checkpoint, project, Some(completed.clone()));
+                    let mutation = queue
+                        .replace(project, queue_input(&completed))
+                        .expect("tracker state is valid");
+                    mutations.push(mutation);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "workflow tracker reconciliation for {project:?} retained its state: {error}"
+                ),
             }
         }
         if !mutations.is_empty() {
@@ -192,7 +202,8 @@ impl WorkflowTracker {
         let next_role = previous
             .next_role
             .ok_or_else(|| "completed workflow has no next role".to_string())?;
-        let (baseline_sha, baseline_source) = capture_baseline(project, next_role, &config)?;
+        let (baseline_sha, baseline_source) =
+            transition_baseline(project, next_role, &previous, &config)?;
         let next = ProjectCheckpoint {
             current_role: next_role,
             status: TrackerStatus::Running,
@@ -201,6 +212,7 @@ impl WorkflowTracker {
             baseline_sha: Some(baseline_sha.clone()),
             baseline_source: Some(baseline_source),
             last_artifact: previous.last_artifact,
+            last_artifact_commit: previous.last_artifact_commit,
             last_observed_sha: Some(baseline_sha),
         };
         set_state(&mut inner.checkpoint, project, Some(next.clone()));
@@ -279,6 +291,9 @@ impl WorkflowTracker {
             baseline_sha,
             baseline_source,
             last_artifact: prior.as_ref().and_then(|state| state.last_artifact.clone()),
+            last_artifact_commit: prior
+                .as_ref()
+                .and_then(|state| state.last_artifact_commit.clone()),
             last_observed_sha: observed_sha,
         };
         set_state(&mut inner.checkpoint, project, Some(next.clone()));
@@ -314,6 +329,9 @@ fn completion_for(
                 branch: "main".to_string(),
             };
             let head = fetch_and_head(&repository)?;
+            if !is_ancestor(&repository, baseline)? {
+                return Err("stored gpt_prompt baseline is no longer an ancestor of origin/main; use Settings alignment".to_string());
+            }
             if head == baseline {
                 return Ok(None);
             }
@@ -342,12 +360,7 @@ fn completion_for(
                 next_role_from_handoff(&artifact.path)
                     .ok_or_else(|| "unrecognized Prepare handoff suffix".to_string())?
             };
-            Ok(Some(completed_artifact(
-                current,
-                artifact.path,
-                next_role,
-                head,
-            )))
+            Ok(Some(completed_artifact(current, artifact, next_role, head)))
         }
     }
 }
@@ -360,27 +373,66 @@ fn completed_execution(current: &ProjectCheckpoint, head: String) -> ProjectChec
         next_role: Some(WorkflowRole::Prepare),
         baseline_sha: current.baseline_sha.clone(),
         baseline_source: current.baseline_source.clone(),
-        last_artifact: None,
+        last_artifact: current.last_artifact.clone(),
+        last_artifact_commit: current.last_artifact_commit.clone(),
         last_observed_sha: Some(head),
     }
 }
 
 fn completed_artifact(
     current: &ProjectCheckpoint,
-    artifact: String,
+    artifact: GitArtifact,
     next_role: WorkflowRole,
     head: String,
 ) -> ProjectCheckpoint {
     ProjectCheckpoint {
         current_role: current.current_role,
         status: TrackerStatus::Completed,
-        label: label_from_artifact(&artifact),
+        label: label_from_artifact(&artifact.path),
         next_role: Some(next_role),
         baseline_sha: current.baseline_sha.clone(),
         baseline_source: current.baseline_source.clone(),
-        last_artifact: Some(artifact),
+        last_artifact: Some(artifact.path),
+        last_artifact_commit: Some(artifact.commit),
         last_observed_sha: Some(head),
     }
+}
+
+fn transition_baseline(
+    project: ProjectId,
+    next_role: WorkflowRole,
+    previous: &ProjectCheckpoint,
+    config: &TrackerConfigFile,
+) -> Result<(String, String), String> {
+    if next_role == WorkflowRole::Execution {
+        return capture_baseline(project, next_role, config);
+    }
+    let anchor = artifact_anchor_for_transition(next_role, previous)?;
+    let repository = GitRepository {
+        path: config
+            .gpt_prompt_path
+            .clone()
+            .ok_or_else(|| "gpt_prompt checkout is not configured".to_string())?,
+        branch: "main".to_string(),
+    };
+    fetch_and_head(&repository)?;
+    if !is_ancestor(&repository, anchor)? {
+        return Err("stored gpt_prompt artifact anchor is no longer an ancestor of origin/main; use Settings alignment".to_string());
+    }
+    Ok((anchor.to_string(), "origin/main".to_string()))
+}
+
+fn artifact_anchor_for_transition(
+    next_role: WorkflowRole,
+    previous: &ProjectCheckpoint,
+) -> Result<&str, String> {
+    if next_role == WorkflowRole::Execution {
+        return Err("Execution uses its target project remote baseline".to_string());
+    }
+    previous.last_artifact_commit.as_deref().ok_or_else(|| {
+        "completed workflow has no causal gpt_prompt artifact anchor; use Settings alignment"
+            .to_string()
+    })
 }
 
 fn capture_baseline(
@@ -565,33 +617,47 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     fs::write(path, content).map_err(|error| error.to_string())
 }
 
-struct BootstrapArtifact {
-    path: String,
+#[derive(Debug, Clone)]
+struct BootstrapEvidence {
     role: WorkflowRole,
     next_role: WorkflowRole,
+    evidence_sha: String,
+    evidence_timestamp: u64,
+    artifact: Option<GitArtifact>,
 }
 
-impl BootstrapArtifact {
-    fn state(self, head: String) -> ProjectCheckpoint {
+impl BootstrapEvidence {
+    fn state(self) -> ProjectCheckpoint {
+        let label = self
+            .artifact
+            .as_ref()
+            .and_then(|artifact| label_from_artifact(&artifact.path));
+        let last_artifact = self.artifact.as_ref().map(|artifact| artifact.path.clone());
+        let last_artifact_commit = self
+            .artifact
+            .as_ref()
+            .map(|artifact| artifact.commit.clone());
         ProjectCheckpoint {
             current_role: self.role,
             status: TrackerStatus::Completed,
-            label: label_from_artifact(&self.path),
+            label,
             next_role: Some(self.next_role),
             baseline_sha: None,
             baseline_source: None,
-            last_artifact: Some(self.path),
-            last_observed_sha: Some(head),
+            last_artifact,
+            last_artifact_commit,
+            last_observed_sha: Some(self.evidence_sha),
         }
     }
 }
 
-fn latest_bootstrap_artifact(
-    repository: &GitRepository,
+fn bootstrap_state(
+    gpt_prompt: &GitRepository,
+    target: &GitRepository,
     project: ProjectId,
-) -> Result<Option<BootstrapArtifact>, String> {
+) -> Result<Option<ProjectCheckpoint>, String> {
     let prepare = newest_current_artifact(
-        repository,
+        gpt_prompt,
         prepare_directory(project),
         &[
             "-execution-handoff.md",
@@ -600,51 +666,61 @@ fn latest_bootstrap_artifact(
         ],
     )?;
     let qa = newest_current_artifact(
-        repository,
+        gpt_prompt,
         qa_directory(project),
         &["-qa-report.md", "-reqa-report.md"],
     )?;
-    match (prepare, qa) {
-        (None, None) => Ok(None),
-        (Some(artifact), None) => {
-            Ok(
-                next_role_from_handoff(&artifact.path).map(|next_role| BootstrapArtifact {
-                    path: artifact.path,
-                    role: WorkflowRole::Prepare,
-                    next_role,
-                }),
-            )
-        }
-        (None, Some(artifact)) => Ok(Some(BootstrapArtifact {
-            path: artifact.path,
-            role: WorkflowRole::Qa,
-            next_role: WorkflowRole::Prepare,
-        })),
-        (Some(prepare), Some(qa)) => {
-            let chosen = if commit_timestamp(repository, &qa.commit)?
-                > commit_timestamp(repository, &prepare.commit)?
-            {
-                qa
-            } else {
-                prepare
-            };
-            if chosen.path.ends_with("-qa-report.md") || chosen.path.ends_with("-reqa-report.md") {
-                Ok(Some(BootstrapArtifact {
-                    path: chosen.path,
-                    role: WorkflowRole::Qa,
-                    next_role: WorkflowRole::Prepare,
-                }))
-            } else {
-                Ok(
-                    next_role_from_handoff(&chosen.path).map(|next_role| BootstrapArtifact {
-                        path: chosen.path,
-                        role: WorkflowRole::Prepare,
-                        next_role,
-                    }),
-                )
-            }
+    let mut candidates = Vec::new();
+    if let Some(artifact) = prepare {
+        if let Some(next_role) = next_role_from_handoff(&artifact.path) {
+            candidates.push(BootstrapEvidence {
+                role: WorkflowRole::Prepare,
+                next_role,
+                evidence_sha: artifact.commit.clone(),
+                evidence_timestamp: commit_timestamp(gpt_prompt, &artifact.commit)?,
+                artifact: Some(artifact),
+            });
         }
     }
+    if let Some(artifact) = qa {
+        candidates.push(BootstrapEvidence {
+            role: WorkflowRole::Qa,
+            next_role: WorkflowRole::Prepare,
+            evidence_sha: artifact.commit.clone(),
+            evidence_timestamp: commit_timestamp(gpt_prompt, &artifact.commit)?,
+            artifact: Some(artifact),
+        });
+    }
+    let (execution_head, execution_timestamp) = fetch_head_with_timestamp(target)?;
+    let execution_anchor = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.role == WorkflowRole::Prepare
+                && candidate.next_role == WorkflowRole::Execution
+        })
+        .filter(|candidate| candidate.evidence_timestamp <= execution_timestamp)
+        .max_by_key(|candidate| candidate.evidence_timestamp)
+        .and_then(|candidate| candidate.artifact.clone());
+    candidates.push(BootstrapEvidence {
+        role: WorkflowRole::Execution,
+        next_role: WorkflowRole::Prepare,
+        evidence_sha: execution_head,
+        evidence_timestamp: execution_timestamp,
+        artifact: execution_anchor,
+    });
+    Ok(select_bootstrap(candidates).map(BootstrapEvidence::state))
+}
+
+fn select_bootstrap(candidates: Vec<BootstrapEvidence>) -> Option<BootstrapEvidence> {
+    let latest = candidates
+        .iter()
+        .map(|candidate| candidate.evidence_timestamp)
+        .max()?;
+    let mut latest_candidates = candidates
+        .into_iter()
+        .filter(|candidate| candidate.evidence_timestamp == latest);
+    let selected = latest_candidates.next()?;
+    latest_candidates.next().is_none().then_some(selected)
 }
 
 #[cfg(test)]
@@ -706,6 +782,7 @@ mod tests {
             baseline_sha: None,
             baseline_source: None,
             last_artifact: None,
+            last_artifact_commit: None,
             last_observed_sha: None,
         };
         assert_eq!(queue_input(&state).status, InputStatus::Completed);
@@ -720,7 +797,15 @@ mod tests {
             baseline_sha: Some("abc123".to_string()),
             baseline_source: Some("origin/main".to_string()),
             last_artifact: None,
+            last_artifact_commit: None,
             last_observed_sha: Some("abc123".to_string()),
+        }
+    }
+
+    fn artifact(path: &str, commit: &str) -> GitArtifact {
+        GitArtifact {
+            path: path.to_string(),
+            commit: commit.to_string(),
         }
     }
 
@@ -728,13 +813,19 @@ mod tests {
     fn prepare_handoffs_complete_only_to_the_filename_role() {
         let execution = completed_artifact(
             &running(WorkflowRole::Prepare),
-            "noctua/prepare/2026-10-02-R9-A16-execution-handoff.md".to_string(),
+            artifact(
+                "noctua/prepare/2026-10-02-R9-A16-execution-handoff.md",
+                "prepare-execution",
+            ),
             WorkflowRole::Execution,
             "def456".to_string(),
         );
         let qa = completed_artifact(
             &running(WorkflowRole::Prepare),
-            "noctua/prepare/2026-10-02-R9-A17-qa-handoff.md".to_string(),
+            artifact(
+                "noctua/prepare/2026-10-02-R9-A17-qa-handoff.md",
+                "prepare-qa",
+            ),
             WorkflowRole::Qa,
             "def456".to_string(),
         );
@@ -746,7 +837,7 @@ mod tests {
     fn qa_and_execution_completion_return_to_prepare() {
         let qa = completed_artifact(
             &running(WorkflowRole::Qa),
-            "fgo/qa/2026-10-02-LEGION-A1-qa-report.md".to_string(),
+            artifact("fgo/qa/2026-10-02-LEGION-A1-qa-report.md", "qa-report"),
             WorkflowRole::Prepare,
             "def456".to_string(),
         );
@@ -762,5 +853,127 @@ mod tests {
         let state = running(WorkflowRole::Execution);
         assert_eq!(state.last_observed_sha, state.baseline_sha);
         assert_eq!(state.status, TrackerStatus::Running);
+    }
+
+    #[test]
+    fn causal_handoffs_use_the_completion_artifact_not_click_time_head() {
+        let prepare_to_qa = completed_artifact(
+            &running(WorkflowRole::Prepare),
+            artifact("noctua/prepare/p1-qa-handoff.md", "P1"),
+            WorkflowRole::Qa,
+            "gpt-head-after-q1".to_string(),
+        );
+        let qa_to_prepare = completed_artifact(
+            &running(WorkflowRole::Qa),
+            artifact("noctua/qa/q1-qa-report.md", "Q1"),
+            WorkflowRole::Prepare,
+            "gpt-head-after-p2".to_string(),
+        );
+        let execution_to_prepare = completed_execution(
+            &completed_artifact(
+                &running(WorkflowRole::Prepare),
+                artifact("noctua/prepare/p1-execution-handoff.md", "P1E"),
+                WorkflowRole::Execution,
+                "gpt-head".to_string(),
+            ),
+            "E1".to_string(),
+        );
+        assert_eq!(
+            artifact_anchor_for_transition(WorkflowRole::Qa, &prepare_to_qa).unwrap(),
+            "P1"
+        );
+        assert_eq!(
+            artifact_anchor_for_transition(WorkflowRole::Prepare, &qa_to_prepare).unwrap(),
+            "Q1"
+        );
+        assert_eq!(
+            artifact_anchor_for_transition(WorkflowRole::Prepare, &execution_to_prepare).unwrap(),
+            "P1E"
+        );
+        assert_eq!(
+            execution_to_prepare.last_artifact.as_deref(),
+            Some("noctua/prepare/p1-execution-handoff.md")
+        );
+    }
+
+    fn evidence(role: WorkflowRole, timestamp: u64) -> BootstrapEvidence {
+        BootstrapEvidence {
+            role,
+            next_role: WorkflowRole::Prepare,
+            evidence_sha: format!("{role:?}-{timestamp}"),
+            evidence_timestamp: timestamp,
+            artifact: None,
+        }
+    }
+
+    #[test]
+    fn bootstrap_selects_only_a_unique_latest_commit_timestamp() {
+        assert_eq!(
+            select_bootstrap(vec![
+                evidence(WorkflowRole::Prepare, 30),
+                evidence(WorkflowRole::Qa, 20),
+                evidence(WorkflowRole::Execution, 10),
+            ])
+            .unwrap()
+            .role,
+            WorkflowRole::Prepare
+        );
+        assert_eq!(
+            select_bootstrap(vec![
+                evidence(WorkflowRole::Prepare, 20),
+                evidence(WorkflowRole::Qa, 30),
+                evidence(WorkflowRole::Execution, 10),
+            ])
+            .unwrap()
+            .role,
+            WorkflowRole::Qa
+        );
+        assert_eq!(
+            select_bootstrap(vec![
+                evidence(WorkflowRole::Prepare, 20),
+                evidence(WorkflowRole::Qa, 10),
+                evidence(WorkflowRole::Execution, 30),
+            ])
+            .unwrap()
+            .role,
+            WorkflowRole::Execution
+        );
+        assert!(select_bootstrap(vec![
+            evidence(WorkflowRole::Prepare, 30),
+            evidence(WorkflowRole::Qa, 30)
+        ])
+        .is_none());
+        assert_eq!(
+            select_bootstrap(vec![evidence(WorkflowRole::Qa, 30)])
+                .unwrap()
+                .role,
+            WorkflowRole::Qa
+        );
+        assert!(select_bootstrap(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn execution_bootstrap_keeps_its_preceding_prepare_anchor() {
+        let execution = BootstrapEvidence {
+            role: WorkflowRole::Execution,
+            next_role: WorkflowRole::Prepare,
+            evidence_sha: "E1".to_string(),
+            evidence_timestamp: 30,
+            artifact: Some(artifact("fgo/prepare/p1-execution-handoff.md", "P1")),
+        };
+        let state = select_bootstrap(vec![evidence(WorkflowRole::Qa, 20), execution])
+            .unwrap()
+            .state();
+        assert_eq!(state.current_role, WorkflowRole::Execution);
+        assert_eq!(state.last_artifact_commit.as_deref(), Some("P1"));
+        assert_eq!(state.label.as_deref(), Some("P1"));
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_artifact_commit_deserializes() {
+        let checkpoint: ProjectCheckpoint =
+            serde_json::from_str(r#"{"currentRole":"qa","status":"completed"}"#).unwrap();
+        assert_eq!(checkpoint.last_artifact_commit, None);
+        assert_eq!(checkpoint.status, TrackerStatus::Completed);
     }
 }
