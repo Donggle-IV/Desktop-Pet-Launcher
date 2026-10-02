@@ -238,7 +238,9 @@ impl WorkflowTracker {
             };
             let candidate = match current.status {
                 TrackerStatus::Running => completion_for(project, &current, &config),
-                TrackerStatus::Completed => refresh_pending_completed(project, &current, &config),
+                TrackerStatus::Completed => {
+                    refresh_pending_completed(project, &current, &config, fence.as_deref())
+                }
             };
             let candidate = match candidate {
                 Ok(candidate) => candidate,
@@ -314,12 +316,14 @@ impl WorkflowTracker {
             previous.current_role,
             WorkflowRole::Prepare | WorkflowRole::Qa
         ) {
-            if let Some(refreshed) = refresh_pending_completed(project, &previous, &config)? {
+            if let Some(refreshed) =
+                refresh_pending_completed(project, &previous, &config, fence.as_deref())?
+            {
                 let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
                 if !matches_current(&inner, project, &previous, fence.as_deref()) {
                     return Ok((HandoffResult::Stale, None));
                 }
-                install_candidate(&mut inner, project, refreshed.clone(), None)?;
+                install_candidate(&mut inner, project, refreshed.clone(), Some(None))?;
                 drop(inner);
                 return Ok((
                     HandoffResult::Refreshed,
@@ -498,6 +502,19 @@ fn refresh_pending_completed(
     project: ProjectId,
     current: &ProjectCheckpoint,
     config: &TrackerConfigFile,
+    startup_fence: Option<&str>,
+) -> Result<Option<ProjectCheckpoint>, String> {
+    let repository = gpt_prompt_repository(config)?;
+    let head = fetch_and_head(&repository)?;
+    refresh_pending_completed_at(project, current, &repository, &head, startup_fence)
+}
+
+fn refresh_pending_completed_at(
+    project: ProjectId,
+    current: &ProjectCheckpoint,
+    repository: &GitRepository,
+    head: &str,
+    startup_fence: Option<&str>,
 ) -> Result<Option<ProjectCheckpoint>, String> {
     let (directory, suffixes) = match current.current_role {
         WorkflowRole::Prepare => (
@@ -514,30 +531,44 @@ fn refresh_pending_completed(
         ),
         WorkflowRole::Execution => return Ok(None),
     };
-    let baseline = current.last_artifact_commit.as_deref().ok_or_else(|| {
-        "completed artifact workflow has no artifact commit identity; use Settings alignment"
-            .to_string()
-    })?;
-    let repository = gpt_prompt_repository(config)?;
-    let head = fetch_and_head(&repository)?;
-    if !is_ancestor_of(&repository, baseline, &head)? {
+    let baseline = current
+        .recovery_anchor
+        .as_deref()
+        .or(current.last_artifact_commit.as_deref())
+        .ok_or_else(|| {
+            "completed workflow has no causal recovery cursor; use Settings alignment".to_string()
+        })?;
+    if !is_ancestor_of(repository, baseline, head)? {
         return Err("stored completed artifact anchor is no longer an ancestor of origin/main; use Settings alignment".to_string());
     }
     let artifact =
-        match newest_added_artifact_between(&repository, baseline, &head, directory, suffixes)? {
+        match newest_added_artifact_between(repository, baseline, head, directory, suffixes)? {
             ArtifactLookup::Found(artifact) => artifact,
             ArtifactLookup::None => return Ok(None),
             ArtifactLookup::Ambiguous => {
                 return Err("newer completion artifacts are ambiguous".to_string())
             }
         };
+    if let Some(fence) = startup_fence {
+        if artifact.commit == fence || !is_ancestor_of(repository, fence, &artifact.commit)? {
+            return Err(
+                "startup recovery invariant failed: a pre-fence artifact was offered as live work"
+                    .to_string(),
+            );
+        }
+    }
     let next_role = match current.current_role {
         WorkflowRole::Prepare => next_role_from_handoff(&artifact.path)
             .ok_or_else(|| "unrecognized Prepare handoff suffix".to_string())?,
         WorkflowRole::Qa => WorkflowRole::Prepare,
         WorkflowRole::Execution => unreachable!(),
     };
-    Ok(Some(completed_artifact(current, artifact, next_role, head)))
+    Ok(Some(completed_artifact(
+        current,
+        artifact,
+        next_role,
+        head.to_string(),
+    )))
 }
 
 /// Folds only the fixed Prepare → QA/Execution → Prepare model against one
@@ -575,10 +606,33 @@ fn startup_state_fold(
         }
         Some(state) => Some(state.clone()),
     };
-    // A completed Prepare proof can be followed by a QA proof, and a completed
-    // QA/Execution proof can be followed by a Prepare proof, all before startup.
-    for _ in 0..3 {
-        let Some(state) = current.clone() else { break };
+    // Consume the fixed Prepare/QA recovery chain to a fixed point. A visited
+    // semantic cursor makes malformed history fail rather than spin forever.
+    let mut visited = Vec::new();
+    while let Some(state) = current.clone() {
+        let cursor = (
+            state.current_role,
+            state.status,
+            state.last_artifact_commit.clone(),
+            state.recovery_anchor.clone(),
+            state.next_role,
+        );
+        if visited.iter().any(|previous| previous == &cursor) {
+            return Err("startup recovery invariant failed: causal state repeated".to_string());
+        }
+        visited.push(cursor);
+        // A persisted completed role may have a newer disposition before any
+        // later-role evidence is considered. This is recovery, not a queue event.
+        if matches!(state.current_role, WorkflowRole::Prepare | WorkflowRole::Qa)
+            && state.status == TrackerStatus::Completed
+        {
+            if let Some(refreshed) =
+                refresh_pending_completed_at(project, &state, gpt_prompt, gpt_head, None)?
+            {
+                current = Some(refreshed);
+                continue;
+            }
+        }
         let Some(anchor) = state
             .last_artifact_commit
             .as_deref()
@@ -609,14 +663,18 @@ fn startup_state_fold(
             _ => break,
         };
         if !is_ancestor_of(gpt_prompt, anchor, gpt_head)? {
-            break;
+            return Err(
+                "startup recovery anchor is not an ancestor of its pinned snapshot".to_string(),
+            );
         }
         let artifact =
             match newest_added_artifact_between(gpt_prompt, anchor, gpt_head, directory, suffixes)?
             {
                 ArtifactLookup::Found(artifact) => artifact,
                 ArtifactLookup::None => break,
-                ArtifactLookup::Ambiguous => break,
+                ArtifactLookup::Ambiguous => {
+                    return Err("startup recovery found ambiguous completion artifacts".to_string())
+                }
             };
         let next_role = if role == WorkflowRole::Qa {
             WorkflowRole::Prepare
@@ -734,6 +792,9 @@ fn latest_completed_state_at(
         qa_directory(project),
         &["-qa-report.md", "-reqa-report.md"],
     )?;
+    if matches!(prepare, ArtifactLookup::Ambiguous) || matches!(qa, ArtifactLookup::Ambiguous) {
+        return Err("startup recovery found ambiguous current artifacts".to_string());
+    }
     let mut candidates = Vec::new();
     for (role, lookup) in [(WorkflowRole::Prepare, prepare), (WorkflowRole::Qa, qa)] {
         let ArtifactLookup::Found(artifact) = lookup else {
@@ -994,10 +1055,14 @@ fn artifact_anchor_for_transition(
     if next_role == WorkflowRole::Execution {
         return Err("Execution uses its target project remote baseline".to_string());
     }
-    previous.last_artifact_commit.as_deref().ok_or_else(|| {
-        "completed workflow has no causal gpt_prompt artifact anchor; use Settings alignment"
-            .to_string()
-    })
+    previous
+        .recovery_anchor
+        .as_deref()
+        .or(previous.last_artifact_commit.as_deref())
+        .ok_or_else(|| {
+            "completed workflow has no causal gpt_prompt recovery cursor; use Settings alignment"
+                .to_string()
+        })
 }
 
 fn capture_baseline(

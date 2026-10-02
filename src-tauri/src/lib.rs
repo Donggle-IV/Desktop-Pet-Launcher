@@ -497,7 +497,7 @@ fn get_queue_state(queue: tauri::State<'_, QueueRuntime>) -> QueueProjection {
 }
 
 #[tauri::command]
-fn advance_project_workflow(
+async fn advance_project_workflow(
     project: ProjectId,
     expected_revision: u64,
     expected_next_role: WorkflowRole,
@@ -505,8 +505,13 @@ fn advance_project_workflow(
     tracker: tauri::State<'_, WorkflowTracker>,
     queue: tauri::State<'_, QueueRuntime>,
 ) -> Result<HandoffResult, String> {
-    let (result, mutation) =
-        tracker.advance(project, expected_revision, expected_next_role, &queue)?;
+    let tracker = tracker.inner().clone();
+    let queue = queue.inner().clone();
+    let (result, mutation) = tauri::async_runtime::spawn_blocking(move || {
+        tracker.advance(project, expected_revision, expected_next_role, &queue)
+    })
+    .await
+    .map_err(|error| format!("workflow handoff worker failed: {error}"))??;
     if let Some(mutation) = mutation {
         queue_bridge::emit_mutation(&app, mutation);
     }
@@ -545,7 +550,7 @@ fn get_project_workflow(
 }
 
 #[tauri::command]
-fn align_project_workflow(
+async fn align_project_workflow(
     project: ProjectId,
     role: WorkflowRole,
     status: TrackerStatus,
@@ -554,7 +559,13 @@ fn align_project_workflow(
     tracker: tauri::State<'_, WorkflowTracker>,
     queue: tauri::State<'_, QueueRuntime>,
 ) -> Result<(), String> {
-    let mutation = tracker.align(project, role, status, next_role, &queue)?;
+    let tracker = tracker.inner().clone();
+    let queue = queue.inner().clone();
+    let mutation = tauri::async_runtime::spawn_blocking(move || {
+        tracker.align(project, role, status, next_role, &queue)
+    })
+    .await
+    .map_err(|error| format!("workflow alignment worker failed: {error}"))??;
     queue_bridge::emit_mutation(&app, mutation);
     Ok(())
 }
