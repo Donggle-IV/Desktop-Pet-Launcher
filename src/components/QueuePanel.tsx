@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { advanceProjectWorkflow, completeExecutionWorkflow, getWorkflowHandoffTarget } from "../lib/tauriApi";
+import { useCallback, useEffect, useState } from "react";
+import { advanceProjectWorkflow, completeExecutionWorkflow, getProjectWorkflow, type TrackerProjectView } from "../lib/tauriApi";
 import { type ProjectId, type ProjectState, type QueueProjection, type WorkflowRole, stateForProject } from "../lib/queueContract";
 
 const PROJECTS: Array<{ id: ProjectId; label: string }> = [
@@ -8,28 +8,28 @@ const PROJECTS: Array<{ id: ProjectId; label: string }> = [
 ];
 
 export function QueuePanel({ projection }: { projection: QueueProjection }) {
-  const [targets, setTargets] = useState<Partial<Record<ProjectId, WorkflowRole>>>({});
+  const [workflows, setWorkflows] = useState<Partial<Record<ProjectId, TrackerProjectView>>>({});
 
-  useEffect(() => {
-    let cancelled = false;
-    void Promise.all(PROJECTS.map(async ({ id }) => [id, await getWorkflowHandoffTarget(id)] as const)).then((entries) => {
-      if (!cancelled) {
-        setTargets(Object.fromEntries(entries.filter(([, target]) => target)) as Partial<Record<ProjectId, WorkflowRole>>);
-      }
+  const refreshWorkflows = useCallback(() => {
+    void Promise.all(PROJECTS.map(async ({ id }) => [id, await getProjectWorkflow(id)] as const)).then((entries) => {
+      setWorkflows(Object.fromEntries(entries.filter(([, workflow]) => workflow)) as Partial<Record<ProjectId, TrackerProjectView>>);
     }).catch(() => undefined);
-    return () => { cancelled = true; };
-  }, [projection]);
+  }, []);
+  useEffect(() => {
+    refreshWorkflows();
+  }, [projection, refreshWorkflows]);
 
   return (
     <section className="queue-panel" aria-label="개발 작업 현황">
       {PROJECTS.map((project) => (
-        <QueueRow key={project.id} name={project.label} project={project.id} state={stateForProject(projection, project.id)} nextRole={targets[project.id] ?? null} />
+        <QueueRow key={project.id} name={project.label} project={project.id} state={stateForProject(projection, project.id)} workflow={workflows[project.id] ?? null} refreshWorkflows={refreshWorkflows} />
       ))}
     </section>
   );
 }
 
-function QueueRow({ name, project, state, nextRole }: { name: string; project: ProjectId; state: ProjectState | null; nextRole: WorkflowRole | null }) {
+function QueueRow({ name, project, state, workflow, refreshWorkflows }: { name: string; project: ProjectId; state: ProjectState | null; workflow: TrackerProjectView | null; refreshWorkflows: () => void }) {
+  const nextRole = workflow?.nextRole ?? null;
   const display = state ? formatState(state) : { status: "UNKNOWN", role: null, label: null, tone: "unknown" };
   return (
     <div className={`queue-row is-${display.tone}`}>
@@ -43,10 +43,12 @@ function QueueRow({ name, project, state, nextRole }: { name: string; project: P
           {display.label}
         </span>
       ) : null}
-      {state?.status === "completed" && nextRole ? (
+      {state?.status === "completed" && workflow && nextRole ? (
         <button className="queue-handoff" type="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => {
           event.stopPropagation();
-          void advanceProjectWorkflow(project).catch(() => undefined);
+          void advanceProjectWorkflow(project, workflow.trackerRevision, nextRole).then((result) => {
+            if (result !== "advanced") refreshWorkflows();
+          }).catch(() => refreshWorkflows());
         }} aria-label={`${name} 작업을 ${nextRole} 역할로 전달`} title={`${nextRole.toUpperCase()}로 전달`}>
           ▶ {nextRole.toUpperCase()}
         </button>
@@ -54,7 +56,10 @@ function QueueRow({ name, project, state, nextRole }: { name: string; project: P
       {state?.status === "running" && state.role === "execution" ? (
         <button className="queue-handoff" type="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => {
           event.stopPropagation();
-          void completeExecutionWorkflow(project).catch(() => undefined);
+          if (!workflow) return;
+          void completeExecutionWorkflow(project, workflow.trackerRevision).then((result) => {
+            if (result !== "advanced") refreshWorkflows();
+          }).catch(() => refreshWorkflows());
         }} aria-label={`${name} Execution 작업 완료`} title="Execution 완료">
           ✓ COMPLETE
         </button>

@@ -9,7 +9,8 @@ import type { PetPackage } from "./petContract";
 import type { ProjectId, QueueProjection, WorkflowRole } from "./queueContract";
 
 export type TrackerStatus = "running" | "completed";
-export interface TrackerProjectView { role: WorkflowRole; status: TrackerStatus; label: string | null; nextRole: WorkflowRole | null; }
+export interface TrackerProjectView { role: WorkflowRole; status: TrackerStatus; label: string | null; nextRole: WorkflowRole | null; trackerRevision: number; }
+export type HandoffResult = "advanced" | "refreshed" | "stale";
 
 const UPDATE_MANIFEST_URL = "https://pet.nether.top/latest.json";
 const LATEST_RELEASE_API_URL =
@@ -114,18 +115,18 @@ export async function getQueueState(): Promise<QueueProjection> {
   return invoke<QueueProjection>("get_queue_state");
 }
 
-export async function advanceProjectWorkflow(project: ProjectId): Promise<void> {
+export async function advanceProjectWorkflow(project: ProjectId, expectedRevision: number, expectedNextRole: WorkflowRole): Promise<HandoffResult> {
   if (!isTauriRuntime()) {
-    return;
+    return "stale";
   }
-  await invoke("advance_project_workflow", { project });
+  return invoke<HandoffResult>("advance_project_workflow", { project, expectedRevision, expectedNextRole });
 }
 
-export async function completeExecutionWorkflow(project: ProjectId): Promise<void> {
+export async function completeExecutionWorkflow(project: ProjectId, expectedRevision: number): Promise<HandoffResult> {
   if (!isTauriRuntime()) {
-    return;
+    return "stale";
   }
-  await invoke("complete_execution_workflow", { project });
+  return invoke<HandoffResult>("complete_execution_workflow", { project, expectedRevision });
 }
 
 export async function getWorkflowHandoffTarget(project: ProjectId): Promise<WorkflowRole | null> {

@@ -21,7 +21,7 @@ mod queue_state;
 mod workflow_tracker;
 use queue_bridge::QueueBridge;
 use queue_state::{ProjectId, QueueProjection, QueueRuntime, WorkflowRole};
-use workflow_tracker::{TrackerProjectView, TrackerStatus, WorkflowTracker};
+use workflow_tracker::{HandoffResult, TrackerProjectView, TrackerStatus, WorkflowTracker};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -499,25 +499,33 @@ fn get_queue_state(queue: tauri::State<'_, QueueRuntime>) -> QueueProjection {
 #[tauri::command]
 fn advance_project_workflow(
     project: ProjectId,
+    expected_revision: u64,
+    expected_next_role: WorkflowRole,
     app: AppHandle,
     tracker: tauri::State<'_, WorkflowTracker>,
     queue: tauri::State<'_, QueueRuntime>,
-) -> Result<(), String> {
-    let mutation = tracker.advance(project, &queue)?;
-    queue_bridge::emit_mutation(&app, mutation);
-    Ok(())
+) -> Result<HandoffResult, String> {
+    let (result, mutation) =
+        tracker.advance(project, expected_revision, expected_next_role, &queue)?;
+    if let Some(mutation) = mutation {
+        queue_bridge::emit_mutation(&app, mutation);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
 fn complete_execution_workflow(
     project: ProjectId,
+    expected_revision: u64,
     app: AppHandle,
     tracker: tauri::State<'_, WorkflowTracker>,
     queue: tauri::State<'_, QueueRuntime>,
-) -> Result<(), String> {
-    let mutation = tracker.complete_execution(project, &queue)?;
+) -> Result<HandoffResult, String> {
+    let Some(mutation) = tracker.complete_execution(project, expected_revision, &queue)? else {
+        return Ok(HandoffResult::Stale);
+    };
     queue_bridge::emit_mutation(&app, mutation);
-    Ok(())
+    Ok(HandoffResult::Advanced)
 }
 
 #[tauri::command]

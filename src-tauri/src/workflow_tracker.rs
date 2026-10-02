@@ -1,6 +1,7 @@
 use crate::git_observer::{
-    commit_timestamp, fetch_and_head, fetch_head_with_timestamp, is_ancestor,
-    newest_added_artifact, newest_current_artifact, GitArtifact, GitRepository,
+    commit_timestamp, fetch_and_head, fetch_head_with_timestamp, is_ancestor_of,
+    newest_added_artifact_between, newest_current_artifact_at, ArtifactLookup, GitArtifact,
+    GitRepository,
 };
 use crate::queue_state::{
     InputStatus, ProjectId, ProjectStateInput, QueueMutation, QueueRuntime, WorkflowRole,
@@ -43,6 +44,12 @@ pub(crate) struct ProjectCheckpoint {
     /// Local user-confirmation time for an Execution completion without Git evidence.
     #[serde(default)]
     pub(crate) manual_completed_at: Option<u64>,
+    /// Monotonic per-project compare-and-swap token. Legacy checkpoints start at zero.
+    #[serde(default)]
+    pub(crate) tracker_revision: u64,
+    /// Explicit Settings recovery cursor; it is not an artifact creation identity.
+    #[serde(default)]
+    pub(crate) recovery_anchor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,6 +59,15 @@ pub(crate) struct TrackerProjectView {
     pub(crate) status: TrackerStatus,
     pub(crate) label: Option<String>,
     pub(crate) next_role: Option<WorkflowRole>,
+    pub(crate) tracker_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum HandoffResult {
+    Advanced,
+    Refreshed,
+    Stale,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -129,13 +145,21 @@ impl WorkflowTracker {
     }
 
     pub(crate) fn startup_reconcile(&self, queue: &QueueRuntime) -> Vec<QueueMutation> {
-        let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
-        let Some(config) = inner.config.clone() else {
+        let Some(config) = self
+            .inner
+            .lock()
+            .expect("workflow tracker lock poisoned")
+            .config
+            .clone()
+        else {
             return Vec::new();
         };
         let mut mutations = Vec::new();
         for project in [ProjectId::Noctua, ProjectId::Fgo] {
-            let persisted = state_for(&inner.checkpoint, project).cloned();
+            let persisted = {
+                let inner = self.inner.lock().expect("workflow tracker lock poisoned");
+                state_for(&inner.checkpoint, project).cloned()
+            };
             let observed_gpt = fetch_gpt_prompt(&config);
             let (gpt_repository, gpt_head) = match observed_gpt {
                 Ok(observed) => observed,
@@ -147,7 +171,7 @@ impl WorkflowTracker {
                     continue;
                 }
             };
-            match startup_state_for(
+            match startup_state_fold(
                 project,
                 persisted.as_ref(),
                 &config,
@@ -155,12 +179,26 @@ impl WorkflowTracker {
                 &gpt_head,
             ) {
                 Ok(Some(state)) => {
-                    set_state(&mut inner.checkpoint, project, Some(state.clone()));
-                    set_startup_fence(&mut inner.startup_fences, project, Some(gpt_head));
+                    let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
+                    if state_for(&inner.checkpoint, project) != persisted.as_ref() {
+                        continue;
+                    }
+                    if let Err(error) =
+                        install_candidate(&mut inner, project, state.clone(), Some(Some(gpt_head)))
+                    {
+                        eprintln!("workflow tracker checkpoint write failed: {error}");
+                        continue;
+                    }
+                    drop(inner);
                     mutations.push(queue.restore(project, queue_input(&state)));
                 }
                 Ok(None) => {
+                    let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
+                    if state_for(&inner.checkpoint, project) != persisted.as_ref() {
+                        continue;
+                    }
                     set_startup_fence(&mut inner.startup_fences, project, Some(gpt_head));
+                    drop(inner);
                     if let Some(state) = persisted {
                         mutations.push(queue.restore(project, queue_input(&state)));
                     }
@@ -173,59 +211,71 @@ impl WorkflowTracker {
                 }
             }
         }
-        if let Err(error) = persist(&inner) {
-            eprintln!("workflow tracker checkpoint write failed: {error}");
-        }
         mutations
     }
 
     pub(crate) fn reconcile(&self, queue: &QueueRuntime) -> Vec<QueueMutation> {
-        let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
-        let Some(config) = inner.config.clone() else {
+        let Some(config) = self
+            .inner
+            .lock()
+            .expect("workflow tracker lock poisoned")
+            .config
+            .clone()
+        else {
             return Vec::new();
         };
         let mut mutations = Vec::new();
         for project in [ProjectId::Noctua, ProjectId::Fgo] {
-            let Some(current) = state_for(&inner.checkpoint, project).cloned() else {
+            let (current, fence) = {
+                let inner = self.inner.lock().expect("workflow tracker lock poisoned");
+                let Some(current) = state_for(&inner.checkpoint, project).cloned() else {
+                    continue;
+                };
+                (
+                    current,
+                    startup_fence_for(&inner.startup_fences, project).cloned(),
+                )
+            };
+            let candidate = match current.status {
+                TrackerStatus::Running => completion_for(project, &current, &config),
+                TrackerStatus::Completed => refresh_pending_completed(project, &current, &config),
+            };
+            let candidate = match candidate {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    eprintln!("workflow tracker reconciliation for {project:?} retained its state: {error}");
+                    continue;
+                }
+            };
+            let Some(candidate) = candidate else {
                 continue;
             };
-            match current.status {
-                TrackerStatus::Running => match completion_for(project, &current, &config) {
-                    Ok(Some(completed)) => {
-                        set_state(&mut inner.checkpoint, project, Some(completed.clone()));
-                        if matches!(
-                            current.current_role,
-                            WorkflowRole::Prepare | WorkflowRole::Qa
-                        ) {
-                            set_startup_fence(&mut inner.startup_fences, project, None);
-                        }
-                        let mutation = queue
-                            .replace(project, queue_input(&completed))
-                            .expect("tracker state is valid");
-                        mutations.push(mutation);
-                    }
-                    Ok(None) => {}
-                    Err(error) => eprintln!(
-                        "workflow tracker reconciliation for {project:?} retained its state: {error}"
-                    ),
-                },
-                TrackerStatus::Completed => match refresh_pending_completed(project, &current, &config) {
-                    Ok(Some(refreshed)) => {
-                        set_state(&mut inner.checkpoint, project, Some(refreshed.clone()));
-                        set_startup_fence(&mut inner.startup_fences, project, None);
-                        mutations.push(queue.restore(project, queue_input(&refreshed)));
-                    }
-                    Ok(None) => {}
-                    Err(error) => eprintln!(
-                        "workflow tracker completed refresh for {project:?} retained its state: {error}"
-                    ),
-                }
+            let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
+            if !matches_current(&inner, project, &current, fence.as_deref()) {
+                continue;
             }
-        }
-        if !mutations.is_empty() {
-            if let Err(error) = persist(&inner) {
+            let clear_fence = matches!(
+                current.current_role,
+                WorkflowRole::Prepare | WorkflowRole::Qa
+            );
+            if let Err(error) = install_candidate(
+                &mut inner,
+                project,
+                candidate.clone(),
+                clear_fence.then_some(None),
+            ) {
                 eprintln!("workflow tracker checkpoint write failed: {error}");
+                continue;
             }
+            drop(inner);
+            let mutation = if current.status == TrackerStatus::Running {
+                queue
+                    .replace(project, queue_input(&candidate))
+                    .expect("tracker state is valid")
+            } else {
+                queue.restore(project, queue_input(&candidate))
+            };
+            mutations.push(mutation);
         }
         mutations
     }
@@ -233,43 +283,82 @@ impl WorkflowTracker {
     pub(crate) fn advance(
         &self,
         project: ProjectId,
+        expected_revision: u64,
+        expected_next_role: WorkflowRole,
         queue: &QueueRuntime,
-    ) -> Result<QueueMutation, String> {
-        let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
-        let config = inner
-            .config
-            .clone()
-            .ok_or_else(|| "workflow tracker is unavailable".to_string())?;
-        let previous = state_for(&inner.checkpoint, project)
-            .cloned()
-            .ok_or_else(|| "project workflow is not configured".to_string())?;
-        if previous.status != TrackerStatus::Completed {
-            return Err("only a completed workflow may be handed off".to_string());
+    ) -> Result<(HandoffResult, Option<QueueMutation>), String> {
+        let (config, previous, fence) = {
+            let inner = self.inner.lock().expect("workflow tracker lock poisoned");
+            let config = inner
+                .config
+                .clone()
+                .ok_or_else(|| "workflow tracker is unavailable".to_string())?;
+            let Some(previous) = state_for(&inner.checkpoint, project).cloned() else {
+                return Ok((HandoffResult::Stale, None));
+            };
+            if previous.tracker_revision != expected_revision
+                || previous.status != TrackerStatus::Completed
+                || previous.next_role != Some(expected_next_role)
+            {
+                return Ok((HandoffResult::Stale, None));
+            }
+            (
+                config,
+                previous,
+                startup_fence_for(&inner.startup_fences, project).cloned(),
+            )
+        };
+        // A click is a second observation boundary. It prevents a new same-role
+        // disposition from being skipped between the polling tick and the click.
+        if matches!(
+            previous.current_role,
+            WorkflowRole::Prepare | WorkflowRole::Qa
+        ) {
+            if let Some(refreshed) = refresh_pending_completed(project, &previous, &config)? {
+                let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
+                if !matches_current(&inner, project, &previous, fence.as_deref()) {
+                    return Ok((HandoffResult::Stale, None));
+                }
+                install_candidate(&mut inner, project, refreshed.clone(), None)?;
+                drop(inner);
+                return Ok((
+                    HandoffResult::Refreshed,
+                    Some(queue.restore(project, queue_input(&refreshed))),
+                ));
+            }
         }
-        let next_role = previous
-            .next_role
-            .ok_or_else(|| "completed workflow has no next role".to_string())?;
-        let fence = startup_fence_for(&inner.startup_fences, project).cloned();
+        let next_role = expected_next_role;
         let (baseline_sha, baseline_source, consumed_fence) =
             transition_baseline(project, next_role, &previous, &config, fence.as_deref())?;
         let next = ProjectCheckpoint {
             current_role: next_role,
             status: TrackerStatus::Running,
-            label: previous.label,
+            label: previous.label.clone(),
             next_role: None,
             baseline_sha: Some(baseline_sha.clone()),
             baseline_source: Some(baseline_source),
-            last_artifact: previous.last_artifact,
-            last_artifact_commit: previous.last_artifact_commit,
+            last_artifact: previous.last_artifact.clone(),
+            last_artifact_commit: previous.last_artifact_commit.clone(),
             last_observed_sha: Some(baseline_sha),
             manual_completed_at: None,
+            tracker_revision: previous.tracker_revision.saturating_add(1),
+            recovery_anchor: None,
         };
-        set_state(&mut inner.checkpoint, project, Some(next.clone()));
-        if consumed_fence {
-            set_startup_fence(&mut inner.startup_fences, project, None);
+        let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
+        if !matches_current(&inner, project, &previous, fence.as_deref()) {
+            return Ok((HandoffResult::Stale, None));
         }
-        persist(&inner)?;
-        queue.replace(project, queue_input(&next))
+        install_candidate(
+            &mut inner,
+            project,
+            next.clone(),
+            consumed_fence.then_some(None),
+        )?;
+        drop(inner);
+        Ok((
+            HandoffResult::Advanced,
+            Some(queue.replace(project, queue_input(&next))?),
+        ))
     }
 
     pub(crate) fn handoff_target(&self, project: ProjectId) -> Option<WorkflowRole> {
@@ -286,6 +375,7 @@ impl WorkflowTracker {
             status: state.status,
             label: state.label.clone(),
             next_role: state.next_role,
+            tracker_revision: state.tracker_revision,
         })
     }
 
@@ -297,12 +387,17 @@ impl WorkflowTracker {
         next_role: Option<WorkflowRole>,
         queue: &QueueRuntime,
     ) -> Result<QueueMutation, String> {
-        let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
-        let config = inner
-            .config
-            .clone()
-            .ok_or_else(|| "workflow tracker is unavailable".to_string())?;
-        let prior = state_for(&inner.checkpoint, project).cloned();
+        let (config, prior, prior_fence) = {
+            let inner = self.inner.lock().expect("workflow tracker lock poisoned");
+            (
+                inner
+                    .config
+                    .clone()
+                    .ok_or_else(|| "workflow tracker is unavailable".to_string())?,
+                state_for(&inner.checkpoint, project).cloned(),
+                startup_fence_for(&inner.startup_fences, project).cloned(),
+            )
+        };
         let required_next = match (role, status) {
             (_, TrackerStatus::Running) => None,
             (WorkflowRole::Qa | WorkflowRole::Execution, TrackerStatus::Completed) => {
@@ -321,20 +416,24 @@ impl WorkflowTracker {
         {
             return Err("completed QA and Execution always hand off to Prepare".to_string());
         }
-        let (baseline_sha, baseline_source, observed_sha) = if status == TrackerStatus::Running {
-            let (sha, source) = capture_baseline(project, role, &config)?;
-            (Some(sha.clone()), Some(source), Some(sha))
-        } else {
-            (
-                prior.as_ref().and_then(|state| state.baseline_sha.clone()),
-                prior
-                    .as_ref()
-                    .and_then(|state| state.baseline_source.clone()),
-                prior
-                    .as_ref()
-                    .and_then(|state| state.last_observed_sha.clone()),
-            )
-        };
+        let (baseline_sha, baseline_source, observed_sha, recovery_anchor) =
+            if status == TrackerStatus::Running {
+                let (sha, source) = capture_baseline(project, role, &config)?;
+                (Some(sha.clone()), Some(source), Some(sha), None)
+            } else {
+                // Alignment uses a fresh recovery cursor, separate from artifact provenance.
+                let (_, head) = fetch_gpt_prompt(&config)?;
+                (
+                    prior.as_ref().and_then(|state| state.baseline_sha.clone()),
+                    prior
+                        .as_ref()
+                        .and_then(|state| state.baseline_source.clone()),
+                    prior
+                        .as_ref()
+                        .and_then(|state| state.last_observed_sha.clone()),
+                    Some(head),
+                )
+            };
         let next = ProjectCheckpoint {
             current_role: role,
             status,
@@ -348,27 +447,43 @@ impl WorkflowTracker {
                 .and_then(|state| state.last_artifact_commit.clone()),
             last_observed_sha: observed_sha,
             manual_completed_at: None,
+            tracker_revision: prior
+                .as_ref()
+                .map_or(0, |state| state.tracker_revision.saturating_add(1)),
+            recovery_anchor,
         };
-        set_state(&mut inner.checkpoint, project, Some(next.clone()));
-        set_startup_fence(&mut inner.startup_fences, project, None);
-        persist(&inner)?;
+        let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
+        if state_for(&inner.checkpoint, project) != prior.as_ref()
+            || startup_fence_for(&inner.startup_fences, project).map(String::as_str)
+                != prior_fence.as_deref()
+        {
+            return Err(
+                "workflow changed while Settings alignment was being prepared; retry".to_string(),
+            );
+        }
+        install_candidate(&mut inner, project, next.clone(), Some(None))?;
+        drop(inner);
         Ok(queue.restore(project, queue_input(&next)))
     }
 
     pub(crate) fn complete_execution(
         &self,
         project: ProjectId,
+        expected_revision: u64,
         queue: &QueueRuntime,
-    ) -> Result<QueueMutation, String> {
+    ) -> Result<Option<QueueMutation>, String> {
         let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
         let current = state_for(&inner.checkpoint, project)
             .cloned()
             .ok_or_else(|| "project workflow is not configured".to_string())?;
+        if current.tracker_revision != expected_revision {
+            return Ok(None);
+        }
         validate_manual_execution_completion(&current)?;
         let completed = manually_completed_execution(&current, unix_time_millis());
-        set_state(&mut inner.checkpoint, project, Some(completed.clone()));
-        persist(&inner)?;
-        queue.replace(project, queue_input(&completed))
+        install_candidate(&mut inner, project, completed.clone(), None)?;
+        drop(inner);
+        Ok(Some(queue.replace(project, queue_input(&completed))?))
     }
 }
 
@@ -405,12 +520,17 @@ fn refresh_pending_completed(
     })?;
     let repository = gpt_prompt_repository(config)?;
     let head = fetch_and_head(&repository)?;
-    if !is_ancestor(&repository, baseline)? {
+    if !is_ancestor_of(&repository, baseline, &head)? {
         return Err("stored completed artifact anchor is no longer an ancestor of origin/main; use Settings alignment".to_string());
     }
-    let Some(artifact) = newest_added_artifact(&repository, baseline, directory, suffixes)? else {
-        return Ok(None);
-    };
+    let artifact =
+        match newest_added_artifact_between(&repository, baseline, &head, directory, suffixes)? {
+            ArtifactLookup::Found(artifact) => artifact,
+            ArtifactLookup::None => return Ok(None),
+            ArtifactLookup::Ambiguous => {
+                return Err("newer completion artifacts are ambiguous".to_string())
+            }
+        };
     let next_role = match current.current_role {
         WorkflowRole::Prepare => next_role_from_handoff(&artifact.path)
             .ok_or_else(|| "unrecognized Prepare handoff suffix".to_string())?,
@@ -420,27 +540,106 @@ fn refresh_pending_completed(
     Ok(Some(completed_artifact(current, artifact, next_role, head)))
 }
 
-fn startup_state_for(
+/// Folds only the fixed Prepare → QA/Execution → Prepare model against one
+/// already-pinned gpt SHA. It never projects intermediate recovery states.
+fn startup_state_fold(
     project: ProjectId,
     persisted: Option<&ProjectCheckpoint>,
     config: &TrackerConfigFile,
     gpt_prompt: &GitRepository,
     gpt_head: &str,
 ) -> Result<Option<ProjectCheckpoint>, String> {
-    match persisted {
-        None => latest_completed_state(project, config, gpt_prompt),
-        Some(state) if state.status == TrackerStatus::Running => {
-            let completed = if state.current_role == WorkflowRole::Execution {
-                completion_for(project, state, config)?
-            } else {
-                completion_for_at_gpt_head(project, state, config, gpt_prompt, gpt_head)?
-            };
-            Ok(completed.or_else(|| Some(state.clone())))
+    let target = project_repository(project, config);
+    let target_head = fetch_and_head(&target)?;
+    let mut current = match persisted {
+        None => {
+            latest_completed_state_at(project, config, gpt_prompt, gpt_head, &target, &target_head)?
         }
-        Some(state) => reconcile_completed_startup(project, state, config, gpt_prompt),
+        Some(state)
+            if state.status == TrackerStatus::Running
+                && state.current_role == WorkflowRole::Execution =>
+        {
+            let baseline = state
+                .baseline_sha
+                .as_deref()
+                .ok_or_else(|| "running Execution workflow has no baseline".to_string())?;
+            if baseline != target_head && is_ancestor_of(&target, baseline, &target_head)? {
+                Some(completed_execution(state, target_head))
+            } else {
+                Some(state.clone())
+            }
+        }
+        Some(state) if state.status == TrackerStatus::Running => {
+            completion_for_at_gpt_head(project, state, config, gpt_prompt, gpt_head)?
+                .or_else(|| Some(state.clone()))
+        }
+        Some(state) => Some(state.clone()),
+    };
+    // A completed Prepare proof can be followed by a QA proof, and a completed
+    // QA/Execution proof can be followed by a Prepare proof, all before startup.
+    for _ in 0..3 {
+        let Some(state) = current.clone() else { break };
+        let Some(anchor) = state
+            .last_artifact_commit
+            .as_deref()
+            .or(state.recovery_anchor.as_deref())
+        else {
+            break;
+        };
+        let (role, directory, suffixes) = match (state.current_role, state.status, state.next_role)
+        {
+            (WorkflowRole::Prepare, TrackerStatus::Completed, Some(WorkflowRole::Qa)) => (
+                WorkflowRole::Qa,
+                qa_directory(project),
+                &["-qa-report.md", "-reqa-report.md"][..],
+            ),
+            (
+                WorkflowRole::Qa | WorkflowRole::Execution,
+                TrackerStatus::Completed,
+                Some(WorkflowRole::Prepare),
+            ) => (
+                WorkflowRole::Prepare,
+                prepare_directory(project),
+                &[
+                    "-execution-handoff.md",
+                    "-qa-handoff.md",
+                    "-reqa-handoff.md",
+                ][..],
+            ),
+            _ => break,
+        };
+        if !is_ancestor_of(gpt_prompt, anchor, gpt_head)? {
+            break;
+        }
+        let artifact =
+            match newest_added_artifact_between(gpt_prompt, anchor, gpt_head, directory, suffixes)?
+            {
+                ArtifactLookup::Found(artifact) => artifact,
+                ArtifactLookup::None => break,
+                ArtifactLookup::Ambiguous => break,
+            };
+        let next_role = if role == WorkflowRole::Qa {
+            WorkflowRole::Prepare
+        } else {
+            next_role_from_handoff(&artifact.path)
+                .ok_or_else(|| "unrecognized Prepare handoff suffix".to_string())?
+        };
+        let mut running = state.clone();
+        running.current_role = role;
+        running.status = TrackerStatus::Running;
+        running.baseline_sha = Some(anchor.to_string());
+        running.tracker_revision = state.tracker_revision;
+        current = Some(completed_artifact(
+            &running,
+            artifact,
+            next_role,
+            gpt_head.to_string(),
+        ));
     }
+    Ok(current)
 }
 
+#[allow(dead_code)]
 fn reconcile_completed_startup(
     project: ProjectId,
     persisted: &ProjectCheckpoint,
@@ -459,6 +658,7 @@ fn reconcile_completed_startup(
     )))
 }
 
+#[allow(dead_code)]
 fn newer_completed_state(
     persisted: &ProjectCheckpoint,
     persisted_timestamp: u64,
@@ -471,6 +671,7 @@ fn newer_completed_state(
     }
 }
 
+#[allow(dead_code)]
 fn completed_timestamp(
     project: ProjectId,
     state: &ProjectCheckpoint,
@@ -500,12 +701,82 @@ fn completed_timestamp(
     }
 }
 
+#[allow(dead_code)]
 fn latest_completed_state(
     project: ProjectId,
     config: &TrackerConfigFile,
     gpt_prompt: &GitRepository,
 ) -> Result<Option<ProjectCheckpoint>, String> {
     Ok(latest_completed_evidence(project, config, gpt_prompt)?.map(BootstrapEvidence::state))
+}
+
+fn latest_completed_state_at(
+    project: ProjectId,
+    _config: &TrackerConfigFile,
+    gpt_prompt: &GitRepository,
+    gpt_head: &str,
+    target: &GitRepository,
+    target_head: &str,
+) -> Result<Option<ProjectCheckpoint>, String> {
+    let prepare = newest_current_artifact_at(
+        gpt_prompt,
+        gpt_head,
+        prepare_directory(project),
+        &[
+            "-execution-handoff.md",
+            "-qa-handoff.md",
+            "-reqa-handoff.md",
+        ],
+    )?;
+    let qa = newest_current_artifact_at(
+        gpt_prompt,
+        gpt_head,
+        qa_directory(project),
+        &["-qa-report.md", "-reqa-report.md"],
+    )?;
+    let mut candidates = Vec::new();
+    for (role, lookup) in [(WorkflowRole::Prepare, prepare), (WorkflowRole::Qa, qa)] {
+        let ArtifactLookup::Found(artifact) = lookup else {
+            continue;
+        };
+        let next_role = if role == WorkflowRole::Prepare {
+            next_role_from_handoff(&artifact.path)
+                .ok_or_else(|| "unrecognized Prepare handoff suffix".to_string())?
+        } else {
+            WorkflowRole::Prepare
+        };
+        candidates.push(BootstrapEvidence {
+            role,
+            next_role,
+            evidence_sha: artifact.commit.clone(),
+            evidence_timestamp: git_timestamp_millis(commit_timestamp(
+                gpt_prompt,
+                &artifact.commit,
+            )?)?,
+            artifact: Some(artifact),
+        });
+    }
+    // An uncorrelated target commit is not a bootstrap workflow completion.
+    let target_timestamp = git_timestamp_millis(commit_timestamp(target, target_head)?)?;
+    if let Some(anchor) = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.role == WorkflowRole::Prepare
+                && candidate.next_role == WorkflowRole::Execution
+        })
+        .filter(|candidate| candidate.evidence_timestamp <= target_timestamp)
+        .max_by_key(|candidate| candidate.evidence_timestamp)
+        .and_then(|candidate| candidate.artifact.clone())
+    {
+        candidates.push(BootstrapEvidence {
+            role: WorkflowRole::Execution,
+            next_role: WorkflowRole::Prepare,
+            evidence_sha: target_head.to_string(),
+            evidence_timestamp: target_timestamp,
+            artifact: Some(anchor),
+        });
+    }
+    Ok(select_bootstrap(candidates).map(BootstrapEvidence::state))
 }
 
 fn git_timestamp_millis(timestamp_seconds: u64) -> Result<u64, String> {
@@ -539,6 +810,9 @@ fn completion_for(
             if head == baseline {
                 return Ok(None);
             }
+            if !is_ancestor_of(&repository, baseline, &head)? {
+                return Err("project remote head is not a forward descendant of the Execution baseline; use Settings alignment or ✓ COMPLETE".to_string());
+            }
             Ok(Some(completed_execution(current, head)))
         }
         WorkflowRole::Prepare | WorkflowRole::Qa => {
@@ -562,7 +836,7 @@ fn completion_for_at_gpt_head(
     if current.current_role == WorkflowRole::Execution {
         return Err("Execution does not use gpt_prompt completion evidence".to_string());
     }
-    if !is_ancestor(repository, baseline)? {
+    if !is_ancestor_of(repository, baseline, head)? {
         return Err("stored gpt_prompt baseline is no longer an ancestor of origin/main; use Settings alignment".to_string());
     }
     if head == baseline {
@@ -583,9 +857,14 @@ fn completion_for_at_gpt_head(
         ),
         WorkflowRole::Execution => unreachable!(),
     };
-    let Some(artifact) = newest_added_artifact(repository, baseline, directory, suffixes)? else {
-        return Ok(None);
-    };
+    let artifact =
+        match newest_added_artifact_between(repository, baseline, head, directory, suffixes)? {
+            ArtifactLookup::Found(artifact) => artifact,
+            ArtifactLookup::None => return Ok(None),
+            ArtifactLookup::Ambiguous => {
+                return Err("completion artifacts are ambiguous".to_string())
+            }
+        };
     let next_role = if current.current_role == WorkflowRole::Qa {
         WorkflowRole::Prepare
     } else {
@@ -612,6 +891,8 @@ fn completed_execution(current: &ProjectCheckpoint, head: String) -> ProjectChec
         last_artifact_commit: current.last_artifact_commit.clone(),
         last_observed_sha: Some(head),
         manual_completed_at: None,
+        tracker_revision: current.tracker_revision.saturating_add(1),
+        recovery_anchor: current.recovery_anchor.clone(),
     }
 }
 
@@ -627,6 +908,8 @@ fn manually_completed_execution(current: &ProjectCheckpoint, timestamp: u64) -> 
         last_artifact_commit: current.last_artifact_commit.clone(),
         last_observed_sha: current.last_observed_sha.clone(),
         manual_completed_at: Some(timestamp),
+        tracker_revision: current.tracker_revision.saturating_add(1),
+        recovery_anchor: current.recovery_anchor.clone(),
     }
 }
 
@@ -647,6 +930,8 @@ fn completed_artifact(
         last_artifact_commit: Some(artifact.commit),
         last_observed_sha: Some(head),
         manual_completed_at: None,
+        tracker_revision: current.tracker_revision.saturating_add(1),
+        recovery_anchor: None,
     }
 }
 
@@ -664,7 +949,8 @@ fn transition_baseline(
     let (anchor, consumed_fence) = gpt_transition_anchor(next_role, previous, startup_fence)?;
     if consumed_fence {
         let (repository, _) = fetch_gpt_prompt(config)?;
-        if !is_ancestor(&repository, &anchor)? {
+        let head = fetch_and_head(&repository)?;
+        if !is_ancestor_of(&repository, &anchor, &head)? {
             return Err("startup gpt_prompt fence is no longer an ancestor of origin/main; use Settings alignment".to_string());
         }
         return Ok((anchor, "origin/main".to_string(), true));
@@ -677,7 +963,8 @@ fn transition_baseline(
         branch: "main".to_string(),
     };
     fetch_and_head(&repository)?;
-    if !is_ancestor(&repository, &anchor)? {
+    let head = fetch_and_head(&repository)?;
+    if !is_ancestor_of(&repository, &anchor, &head)? {
         return Err("stored gpt_prompt artifact anchor is no longer an ancestor of origin/main; use Settings alignment".to_string());
     }
     Ok((anchor, "origin/main".to_string(), false))
@@ -879,6 +1166,34 @@ fn set_startup_fence(fences: &mut StartupFences, project: ProjectId, fence: Opti
     }
 }
 
+fn matches_current(
+    inner: &TrackerInner,
+    project: ProjectId,
+    expected: &ProjectCheckpoint,
+    expected_fence: Option<&str>,
+) -> bool {
+    state_for(&inner.checkpoint, project) == Some(expected)
+        && startup_fence_for(&inner.startup_fences, project).map(String::as_str) == expected_fence
+}
+
+/// Write the candidate before replacing the in-memory checkpoint. This keeps an
+/// ordinary write failure from producing a visible state that will disappear on restart.
+fn install_candidate(
+    inner: &mut TrackerInner,
+    project: ProjectId,
+    candidate: ProjectCheckpoint,
+    startup_fence: Option<Option<String>>,
+) -> Result<(), String> {
+    let mut checkpoint = inner.checkpoint.clone();
+    set_state(&mut checkpoint, project, Some(candidate));
+    persist_checkpoint(inner.paths.as_ref(), &checkpoint)?;
+    inner.checkpoint = checkpoint;
+    if let Some(fence) = startup_fence {
+        set_startup_fence(&mut inner.startup_fences, project, fence);
+    }
+    Ok(())
+}
+
 fn load_or_create_config(path: &Path) -> Result<TrackerConfigFile, String> {
     if path.exists() {
         return read_json(path);
@@ -896,12 +1211,12 @@ fn load_checkpoint(path: &Path) -> Result<TrackerCheckpointFile, String> {
     }
 }
 
-fn persist(inner: &TrackerInner) -> Result<(), String> {
-    let path = inner
-        .paths
-        .as_ref()
-        .ok_or_else(|| "workflow tracker is not initialized".to_string())?;
-    write_json(&path.checkpoint, &inner.checkpoint)
+fn persist_checkpoint(
+    paths: Option<&TrackerPaths>,
+    checkpoint: &TrackerCheckpointFile,
+) -> Result<(), String> {
+    let path = paths.ok_or_else(|| "workflow tracker is not initialized".to_string())?;
+    write_json(&path.checkpoint, checkpoint)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
@@ -945,18 +1260,23 @@ impl BootstrapEvidence {
             last_artifact_commit,
             last_observed_sha: Some(self.evidence_sha),
             manual_completed_at: None,
+            tracker_revision: 1,
+            recovery_anchor: None,
         }
     }
 }
 
+#[allow(dead_code)]
 fn latest_completed_evidence(
     project: ProjectId,
     config: &TrackerConfigFile,
     gpt_prompt: &GitRepository,
 ) -> Result<Option<BootstrapEvidence>, String> {
     let target = project_repository(project, config);
-    let prepare = newest_current_artifact(
+    let gpt_head = fetch_and_head(gpt_prompt)?;
+    let prepare = newest_current_artifact_at(
         gpt_prompt,
+        &gpt_head,
         prepare_directory(project),
         &[
             "-execution-handoff.md",
@@ -964,13 +1284,14 @@ fn latest_completed_evidence(
             "-reqa-handoff.md",
         ],
     )?;
-    let qa = newest_current_artifact(
+    let qa = newest_current_artifact_at(
         gpt_prompt,
+        &gpt_head,
         qa_directory(project),
         &["-qa-report.md", "-reqa-report.md"],
     )?;
     let mut candidates = Vec::new();
-    if let Some(artifact) = prepare {
+    if let ArtifactLookup::Found(artifact) = prepare {
         if let Some(next_role) = next_role_from_handoff(&artifact.path) {
             candidates.push(BootstrapEvidence {
                 role: WorkflowRole::Prepare,
@@ -984,7 +1305,7 @@ fn latest_completed_evidence(
             });
         }
     }
-    if let Some(artifact) = qa {
+    if let ArtifactLookup::Found(artifact) = qa {
         candidates.push(BootstrapEvidence {
             role: WorkflowRole::Qa,
             next_role: WorkflowRole::Prepare,
@@ -1091,6 +1412,8 @@ mod tests {
             last_artifact_commit: None,
             last_observed_sha: None,
             manual_completed_at: None,
+            tracker_revision: 0,
+            recovery_anchor: None,
         };
         assert_eq!(queue_input(&state).status, InputStatus::Completed);
     }
@@ -1107,6 +1430,8 @@ mod tests {
             last_artifact_commit: None,
             last_observed_sha: Some("abc123".to_string()),
             manual_completed_at: None,
+            tracker_revision: 0,
+            recovery_anchor: None,
         }
     }
 

@@ -18,7 +18,8 @@ Noctua / FGO workflow state
 ## Current phases
 
 - **Phase 1 — Windows Desktop Runtime:** COMPLETE / BASELINE FROZEN (`1fe8bd97be5e50b8935f6f23e40e1c5d008eaf98`).
-- **Phase 2 — Development Queue Aide:** NEXT.
+- **Phase 2A — Development Queue Aide runtime/presentation:** implemented.
+- **Phase 2B — local Git workflow tracker:** implemented for the fixed Noctua/FGO snapshot model.
 - **Later — Local producers/adapters:** selected after the queue runtime contract is stable.
 
 The earlier assumption that a ChatGPT Browser Observer must be next is retired.
@@ -36,7 +37,7 @@ Exact field names and status terminology remain unfrozen.
 
 ## Roles and statuses
 
-Relevant roles are Prepare, QA, and Execution. Candidate statuses are `running`, `completed`, `waiting`, and `failed` or `blocked`. 이설 does not declare a larger workflow state machine unless implementation evidence requires it.
+Relevant roles are Prepare, QA, and Execution. Tracker product statuses are running and completed. Local Git completion evidence moves a running role to completed; an explicit user handoff moves a completed role to its fixed next running role. Execution also permits an explicit local COMPLETE confirmation. 이설 does not declare a larger workflow state machine.
 
 ## UI principle
 
@@ -64,23 +65,8 @@ Rust backend authoritative runtime queue snapshot
 
 `AppSettings` remains preference storage and is not the default queue-state store.
 
-## Persistence direction
+## Tracker boundary and startup recovery
 
-External workflow state is transient by default. On restart, a previous `running` state is not automatically trusted; a producer should re-establish current state.
+The tracker observes configured local Git checkouts only; it requires no GitHub API or token. A small checkpoint stores per-project causal anchors, recovery cursors, and a revision token, while QueueRuntime is transient presentation/acknowledgement state. Startup reconciles a pinned local Git snapshot into one final causally provable state before projecting it. It does not restore stale running state blindly or replay pre-start workflow history through the visible queue.
 
-## Local transport direction
-
-Loopback-only HTTP JSON is the primary candidate. Local WebSocket and Rust/Tauri-native IPC remain legitimate comparison options until architecture discovery closes the decision. Any input must be machine-local, avoid network-wide binding and unnecessary remote exposure, and avoid an enterprise auth/account system. Malformed JSON, unsupported methods, and excessive request bodies should be handled safely.
-
-## Open architecture questions
-
-- Where authoritative runtime queue state lives.
-- The exact snapshot contract and status set, including whether idle is explicit or absence.
-- Precedence with manual, chat, drag, and idle-variety state.
-- Overall animation arbitration for simultaneous Noctua/FGO states and completion acknowledgement behavior.
-- Compact overlay geometry and the Rust–PetWindow state/event boundary.
-- Local transport, lifecycle, and fixed versus dynamic port if HTTP is selected.
-- Bridge-startup failure behavior and stale producer handling.
-- The minimal boundary that keeps producers and renderer decoupled.
-
-These remain open until Prepare inspects the current implementation.
+Git graph order is used within gpt_prompt; cross-repository correlation remains conservatively timestamp-based where the repositories do not share ancestry.
