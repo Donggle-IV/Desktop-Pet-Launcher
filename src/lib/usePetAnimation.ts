@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { STATE_DEFINITIONS, type PetState } from "./petContract";
+import {
+  getAnimationCycleDuration as getCycleDuration,
+  getAnimationFrameDuration,
+} from "./animationTiming";
+
+export function getAnimationCycleDuration(state: PetState, speed: number): number {
+  return getCycleDuration(STATE_DEFINITIONS[state].durations, speed);
+}
 
 export function usePetAnimation(
   state: PetState,
@@ -26,12 +34,12 @@ export function usePetAnimation(
       current = (current + 1) % definition.frames;
       setFrame(current);
       const duration = definition.durations[current] ?? 140;
-      timerRef.current = window.setTimeout(tick, Math.max(40, duration / speed));
+      timerRef.current = window.setTimeout(tick, getAnimationFrameDuration(duration, speed));
     };
 
     timerRef.current = window.setTimeout(
       tick,
-      Math.max(40, (definition.durations[0] ?? 140) / speed),
+      getAnimationFrameDuration(definition.durations[0] ?? 140, speed),
     );
 
     return () => {

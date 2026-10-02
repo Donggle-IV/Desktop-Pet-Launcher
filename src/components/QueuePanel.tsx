@@ -16,32 +16,36 @@ export function QueuePanel({ projection }: { projection: QueueProjection }) {
 }
 
 function QueueRow({ name, state }: { name: string; state: ProjectState | null }) {
-  const display = state ? formatState(state) : { status: "UNKNOWN", role: "", label: "—", tone: "unknown" };
+  const display = state ? formatState(state) : { status: "UNKNOWN", role: null, label: null, tone: "unknown" };
   return (
     <div className={`queue-row is-${display.tone}`}>
       <strong>{name}</strong>
-      <span className="queue-status">{display.status}</span>
-      <span className="queue-role">{display.role}</span>
-      <span className="queue-label" title={display.label}>
-        {display.label}
+      <span className="queue-summary">
+        {display.role ? <span className="queue-role">{display.role}</span> : null}
+        <span className="queue-status">{display.status}</span>
       </span>
+      {display.label ? (
+        <span className="queue-label" title={display.label}>
+          {display.label}
+        </span>
+      ) : null}
     </div>
   );
 }
 
 function formatState(state: ProjectState): {
   status: string;
-  role: string;
-  label: string;
+  role: string | null;
+  label: string | null;
   tone: string;
 } {
   if (state.status === "idle") {
-    return { status: "IDLE", role: "", label: "○", tone: "idle" };
+    return { status: "IDLE", role: null, label: null, tone: "idle" };
   }
   return {
     status: state.status.toUpperCase(),
     role: state.role.toUpperCase(),
-    label: state.label ?? "—",
+    label: state.label,
     tone: state.status,
   };
 }

@@ -169,17 +169,21 @@ export async function notifyPetSettings(settings: AppSettings): Promise<void> {
   await getCurrentWindow().emitTo("pet", "settings-updated", settings);
 }
 
-export async function setCurrentWindowGeometry(settings: AppSettings): Promise<void> {
+export async function setCurrentWindowGeometry(
+  settings: AppSettings,
+  extraHeight = 0,
+): Promise<void> {
   if (!isTauriRuntime()) {
     return;
   }
+  const frameSettings = { ...settings, height: settings.height + Math.max(0, extraHeight) };
   const window = getCurrentWindow();
-  const position = await normalizePetWindowPosition(settings);
+  const position = await normalizePetWindowPosition(frameSettings);
   await setPetWindowFrame({
     x: position.x,
     y: position.y,
-    width: settings.width,
-    height: settings.height,
+    width: frameSettings.width,
+    height: frameSettings.height,
   });
   await window.setAlwaysOnTop(settings.alwaysOnTop);
   await window.setIgnoreCursorEvents(settings.clickThrough);

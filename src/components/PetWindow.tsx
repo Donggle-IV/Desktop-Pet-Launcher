@@ -39,7 +39,7 @@ import {
   toAssetUrl,
   type ChatMessage,
 } from "../lib/tauriApi";
-import { usePetAnimation } from "../lib/usePetAnimation";
+import { getAnimationCycleDuration, usePetAnimation } from "../lib/usePetAnimation";
 import { DEFAULT_PALETTE, extractPetPalette, type PetPalette } from "../lib/petPalette";
 import { QueuePanel } from "./QueuePanel";
 import {
@@ -60,7 +60,7 @@ type ChatSide = "left" | "right";
 const CHAT_BUTTON_SIZE = 34;
 const CHAT_BUTTON_INSET = 2;
 const CHAT_HOTSPOT_PADDING = 14;
-const QUEUE_PANEL_HEIGHT = 70;
+const QUEUE_PANEL_HEIGHT = 62;
 
 interface WindowOffset {
   x: number;
@@ -128,8 +128,7 @@ export function PetWindow() {
       ) {
         await saveSettings(nextSettings);
       }
-      await setCurrentWindowGeometry(nextSettings);
-      await setCurrentWindowSize(nextSettings.width, nextSettings.height + QUEUE_PANEL_HEIGHT);
+      await setCurrentWindowGeometry(nextSettings, QUEUE_PANEL_HEIGHT);
       positionSaveEnabledAtRef.current = Date.now() + 1500;
       setReady(true);
     }
@@ -178,10 +177,10 @@ export function PetWindow() {
     if (completionAcknowledgement === null) {
       return;
     }
-    const duration = STATE_DEFINITIONS.waving.durations.reduce((total, value) => total + value, 0);
+    const duration = getAnimationCycleDuration("waving", settings.animationSpeed);
     const timer = window.setTimeout(() => setCompletionAcknowledgement(null), duration);
     return () => window.clearTimeout(timer);
-  }, [completionAcknowledgement]);
+  }, [completionAcknowledgement, settings.animationSpeed]);
 
   useEffect(() => {
     if (!settings.idleVariety || settings.reducedMotion || settings.manualState !== "idle") {
