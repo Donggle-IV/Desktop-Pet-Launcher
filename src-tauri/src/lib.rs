@@ -4,6 +4,8 @@ use std::env;
 use std::fs;
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -13,10 +15,13 @@ use tauri::{
 
 mod network;
 use network::NetworkState;
+mod git_observer;
 mod queue_bridge;
 mod queue_state;
+mod workflow_tracker;
 use queue_bridge::QueueBridge;
-use queue_state::{QueueProjection, QueueRuntime};
+use queue_state::{ProjectId, QueueProjection, QueueRuntime, WorkflowRole};
+use workflow_tracker::WorkflowTracker;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -491,11 +496,41 @@ fn get_queue_state(queue: tauri::State<'_, QueueRuntime>) -> QueueProjection {
     queue.projection()
 }
 
+#[tauri::command]
+fn advance_project_workflow(
+    project: ProjectId,
+    app: AppHandle,
+    tracker: tauri::State<'_, WorkflowTracker>,
+    queue: tauri::State<'_, QueueRuntime>,
+) -> Result<(), String> {
+    let mutation = tracker.advance(project, &queue)?;
+    queue_bridge::emit_mutation(&app, mutation);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_workflow_handoff_target(
+    project: ProjectId,
+    tracker: tauri::State<'_, WorkflowTracker>,
+) -> Option<WorkflowRole> {
+    tracker.handoff_target(project)
+}
+
+fn start_workflow_tracker(app: AppHandle, tracker: WorkflowTracker, queue: QueueRuntime) {
+    thread::spawn(move || loop {
+        for mutation in tracker.reconcile(&queue) {
+            queue_bridge::emit_mutation(&app, mutation);
+        }
+        thread::sleep(Duration::from_secs(15));
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
     let queue_runtime = QueueRuntime::default();
     let queue_bridge = QueueBridge::default();
+    let workflow_tracker = WorkflowTracker::default();
     let queue_bridge_shutdown = queue_bridge.clone();
 
     #[cfg(desktop)]
@@ -512,6 +547,7 @@ pub fn run() {
         .manage(NetworkState::new().expect("failed to create HTTP client"))
         .manage(queue_runtime)
         .manage(queue_bridge)
+        .manage(workflow_tracker)
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -534,6 +570,8 @@ pub fn run() {
             import_pet_from_url,
             send_llm_chat,
             get_queue_state,
+            advance_project_workflow,
+            get_workflow_handoff_target,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;
@@ -542,6 +580,20 @@ pub fn run() {
             let queue = (*app.state::<QueueRuntime>()).clone();
             if let Err(error) = bridge.start(app.handle().clone(), queue) {
                 eprintln!("queue bridge disabled: {error}");
+            }
+            let tracker = (*app.state::<WorkflowTracker>()).clone();
+            let queue = (*app.state::<QueueRuntime>()).clone();
+            match app.handle().path().app_data_dir() {
+                Ok(path) => match tracker.initialize(path, &queue) {
+                    Ok(()) => {
+                        if let Err(error) = tracker.bootstrap(&queue) {
+                            eprintln!("workflow tracker bootstrap disabled: {error}");
+                        }
+                        start_workflow_tracker(app.handle().clone(), tracker, queue);
+                    }
+                    Err(error) => eprintln!("workflow tracker disabled: {error}"),
+                },
+                Err(error) => eprintln!("workflow tracker disabled: {error}"),
             }
             Ok(())
         })

@@ -1,4 +1,6 @@
-import { type ProjectId, type ProjectState, type QueueProjection, stateForProject } from "../lib/queueContract";
+import { useEffect, useState } from "react";
+import { advanceProjectWorkflow, getWorkflowHandoffTarget } from "../lib/tauriApi";
+import { type ProjectId, type ProjectState, type QueueProjection, type WorkflowRole, stateForProject } from "../lib/queueContract";
 
 const PROJECTS: Array<{ id: ProjectId; label: string }> = [
   { id: "noctua", label: "NOCTUA" },
@@ -6,16 +8,28 @@ const PROJECTS: Array<{ id: ProjectId; label: string }> = [
 ];
 
 export function QueuePanel({ projection }: { projection: QueueProjection }) {
+  const [targets, setTargets] = useState<Partial<Record<ProjectId, WorkflowRole>>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(PROJECTS.map(async ({ id }) => [id, await getWorkflowHandoffTarget(id)] as const)).then((entries) => {
+      if (!cancelled) {
+        setTargets(Object.fromEntries(entries.filter(([, target]) => target)) as Partial<Record<ProjectId, WorkflowRole>>);
+      }
+    }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [projection]);
+
   return (
     <section className="queue-panel" aria-label="개발 작업 현황">
       {PROJECTS.map((project) => (
-        <QueueRow key={project.id} name={project.label} state={stateForProject(projection, project.id)} />
+        <QueueRow key={project.id} name={project.label} project={project.id} state={stateForProject(projection, project.id)} nextRole={targets[project.id] ?? null} />
       ))}
     </section>
   );
 }
 
-function QueueRow({ name, state }: { name: string; state: ProjectState | null }) {
+function QueueRow({ name, project, state, nextRole }: { name: string; project: ProjectId; state: ProjectState | null; nextRole: WorkflowRole | null }) {
   const display = state ? formatState(state) : { status: "UNKNOWN", role: null, label: null, tone: "unknown" };
   return (
     <div className={`queue-row is-${display.tone}`}>
@@ -28,6 +42,14 @@ function QueueRow({ name, state }: { name: string; state: ProjectState | null })
         <span className="queue-label" title={display.label}>
           {display.label}
         </span>
+      ) : null}
+      {state?.status === "completed" && nextRole ? (
+        <button className="queue-handoff" type="button" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => {
+          event.stopPropagation();
+          void advanceProjectWorkflow(project).catch(() => undefined);
+        }} aria-label={`${name} 작업을 ${nextRole} 역할로 전달`} title={`${nextRole.toUpperCase()}로 전달`}>
+          ▶ {nextRole.toUpperCase()}
+        </button>
       ) : null}
     </div>
   );

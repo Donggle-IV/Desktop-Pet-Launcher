@@ -6,7 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import packageInfo from "../../package.json";
 import type { AppSettings } from "./settings";
 import type { PetPackage } from "./petContract";
-import type { QueueProjection } from "./queueContract";
+import type { ProjectId, QueueProjection, WorkflowRole } from "./queueContract";
 
 const UPDATE_MANIFEST_URL = "https://pet.nether.top/latest.json";
 const LATEST_RELEASE_API_URL =
@@ -109,6 +109,20 @@ export async function getQueueState(): Promise<QueueProjection> {
     return { revision: 0, noctua: null, fgo: null };
   }
   return invoke<QueueProjection>("get_queue_state");
+}
+
+export async function advanceProjectWorkflow(project: ProjectId): Promise<void> {
+  if (!isTauriRuntime()) {
+    return;
+  }
+  await invoke("advance_project_workflow", { project });
+}
+
+export async function getWorkflowHandoffTarget(project: ProjectId): Promise<WorkflowRole | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+  return invoke<WorkflowRole | null>("get_workflow_handoff_target", { project });
 }
 
 export async function showSettingsWindow(): Promise<void> {

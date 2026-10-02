@@ -202,6 +202,17 @@ impl QueueRuntime {
         })
     }
 
+    pub(crate) fn restore(&self, project: ProjectId, input: ProjectStateInput) -> QueueMutation {
+        let next = validate_input(input).expect("persisted tracker checkpoint must be valid");
+        let mut inner = self.inner.lock().expect("queue runtime lock poisoned");
+        inner.revision = inner.revision.saturating_add(1);
+        *project_slot_mut(&mut inner, project) = Some(next);
+        QueueMutation {
+            projection: projection_from_inner(&inner),
+            completed: None,
+        }
+    }
+
     pub(crate) fn clear(&self, project: ProjectId) -> QueueMutation {
         let mut inner = self.inner.lock().expect("queue runtime lock poisoned");
         inner.revision = inner.revision.saturating_add(1);
@@ -370,5 +381,16 @@ mod tests {
         let cleared = runtime.clear(ProjectId::Fgo);
         assert!(cleared.projection.fgo.is_none());
         assert_eq!(cleared.projection.revision, 3);
+    }
+
+    #[test]
+    fn restore_completed_state_does_not_replay_completion() {
+        let runtime = QueueRuntime::default();
+        let mutation = runtime.restore(ProjectId::Noctua, active(InputStatus::Completed));
+        assert!(mutation.completed.is_none());
+        assert_eq!(
+            mutation.projection.noctua.unwrap().status,
+            SnapshotStatus::Completed
+        );
     }
 }

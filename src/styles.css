@@ -149,6 +149,21 @@ button {
   white-space: nowrap;
 }
 
+.queue-handoff {
+  grid-column: 2 / -1;
+  justify-self: start;
+  margin-top: 2px;
+  padding: 1px 4px;
+  color: #d8f0e0;
+  background: rgba(216, 240, 224, 0.1);
+  border: 1px solid rgba(216, 240, 224, 0.38);
+  border-radius: 5px;
+  font: inherit;
+  font-size: 8px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
 .pet-loading {
   width: 192px;
   height: 208px;
