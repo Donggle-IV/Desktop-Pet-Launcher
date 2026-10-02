@@ -8,6 +8,9 @@ import type { AppSettings } from "./settings";
 import type { PetPackage } from "./petContract";
 import type { ProjectId, QueueProjection, WorkflowRole } from "./queueContract";
 
+export type TrackerStatus = "running" | "completed";
+export interface TrackerProjectView { role: WorkflowRole; status: TrackerStatus; label: string | null; nextRole: WorkflowRole | null; }
+
 const UPDATE_MANIFEST_URL = "https://pet.nether.top/latest.json";
 const LATEST_RELEASE_API_URL =
   "https://api.github.com/repos/wangling-miao/Desktop-Pet-Launcher/releases/latest";
@@ -123,6 +126,16 @@ export async function getWorkflowHandoffTarget(project: ProjectId): Promise<Work
     return null;
   }
   return invoke<WorkflowRole | null>("get_workflow_handoff_target", { project });
+}
+
+export async function getProjectWorkflow(project: ProjectId): Promise<TrackerProjectView | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<TrackerProjectView | null>("get_project_workflow", { project });
+}
+
+export async function alignProjectWorkflow(project: ProjectId, role: WorkflowRole, status: TrackerStatus, nextRole: WorkflowRole | null): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await invoke("align_project_workflow", { project, role, status, nextRole });
 }
 
 export async function showSettingsWindow(): Promise<void> {

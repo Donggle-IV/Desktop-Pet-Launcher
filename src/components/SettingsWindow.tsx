@@ -42,6 +42,7 @@ import {
   APP_LATEST_RELEASE_URL,
   applyPetWindowSettings,
   checkForAppUpdate,
+  alignProjectWorkflow,
   choosePetFolder,
   importPetFromUrl,
   listPetPackages,
@@ -52,7 +53,11 @@ import {
   type GalleryIndex,
   type GalleryPet,
   type UpdateCheckResult,
+  type TrackerProjectView,
+  type TrackerStatus,
+  getProjectWorkflow,
 } from "../lib/tauriApi";
+import type { ProjectId, WorkflowRole } from "../lib/queueContract";
 
 const STATE_LABELS: Record<PetState, string> = {
   idle: "대기",
@@ -104,11 +109,31 @@ export function SettingsWindow() {
   });
   const [status, setStatus] = useState("준비됨");
   const [newPetFolder, setNewPetFolder] = useState("");
+  const [trackerViews, setTrackerViews] = useState<Partial<Record<ProjectId, TrackerProjectView>>>({});
+  const [trackerProject, setTrackerProject] = useState<ProjectId>("noctua");
+  const [trackerRole, setTrackerRole] = useState<WorkflowRole>("prepare");
+  const [trackerStatus, setTrackerStatus] = useState<TrackerStatus>("running");
+  const [trackerNextRole, setTrackerNextRole] = useState<WorkflowRole>("execution");
 
   const activePet = useMemo(
     () => packages.find((candidate) => candidate.id === resolveActivePetId(settings.activePetId, packages)),
     [packages, settings.activePetId],
   );
+
+  const refreshTracker = useCallback(async () => {
+    const entries = await Promise.all((["noctua", "fgo"] as const).map(async (project) => [project, await getProjectWorkflow(project)] as const));
+    setTrackerViews(Object.fromEntries(entries.filter(([, value]) => value)) as Partial<Record<ProjectId, TrackerProjectView>>);
+  }, []);
+
+  useEffect(() => { void refreshTracker().catch(() => undefined); }, [refreshTracker]);
+
+  const alignTracker = async () => {
+    try {
+      await alignProjectWorkflow(trackerProject, trackerRole, trackerStatus, trackerRole === "prepare" && trackerStatus === "completed" ? trackerNextRole : null);
+      await refreshTracker();
+      setStatus("개발 Queue 상태를 정렬했습니다");
+    } catch (error) { setStatus(error instanceof Error ? error.message : "Queue 상태 정렬에 실패했습니다"); }
+  };
   const scalePercent = Math.round((settings.width / BASE_CELL.width) * 100);
   const filteredGalleryPets = useMemo(() => {
     const query = gallerySearch.trim().toLowerCase();
@@ -869,6 +894,22 @@ export function SettingsWindow() {
               <span>{STATE_LABELS[settings.manualState]}</span>
               <span>{settings.pixelated ? "픽셀" : "부드럽게"}</span>
             </div>
+          </section>
+
+          <section className="panel tracker-panel">
+            <div className="panel-title"><RefreshCw size={18} /><h2>개발 Queue 상태 정렬</h2></div>
+            <p className="panel-note">초기 또는 복구 시 현재 위치를 맞춥니다. 일상적인 전달은 펫 창의 ▶ 버튼을 사용하세요.</p>
+            <div className="render-facts">
+              <span>NOCTUA: {trackerViews.noctua ? `${trackerViews.noctua.role} · ${trackerViews.noctua.status}` : "미설정"}</span>
+              <span>FGO: {trackerViews.fgo ? `${trackerViews.fgo.role} · ${trackerViews.fgo.status}` : "미설정"}</span>
+            </div>
+            <div className="split-fields">
+              <label className="field"><span>프로젝트</span><select value={trackerProject} onChange={(event) => setTrackerProject(event.target.value as ProjectId)}><option value="noctua">Noctua</option><option value="fgo">FGO</option></select></label>
+              <label className="field"><span>역할</span><select value={trackerRole} onChange={(event) => setTrackerRole(event.target.value as WorkflowRole)}><option value="prepare">Prepare</option><option value="qa">QA</option><option value="execution">Execution</option></select></label>
+              <label className="field"><span>상태</span><select value={trackerStatus} onChange={(event) => setTrackerStatus(event.target.value as TrackerStatus)}><option value="running">Running</option><option value="completed">Completed</option></select></label>
+              {trackerRole === "prepare" && trackerStatus === "completed" ? <label className="field"><span>다음 역할</span><select value={trackerNextRole} onChange={(event) => setTrackerNextRole(event.target.value as WorkflowRole)}><option value="execution">Execution</option><option value="qa">QA</option></select></label> : null}
+            </div>
+            <button className="wide-button" type="button" onClick={() => void alignTracker()}>상태 정렬 적용</button>
           </section>
         </div>
       </section>

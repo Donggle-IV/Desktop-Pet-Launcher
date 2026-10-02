@@ -21,7 +21,7 @@ mod queue_state;
 mod workflow_tracker;
 use queue_bridge::QueueBridge;
 use queue_state::{ProjectId, QueueProjection, QueueRuntime, WorkflowRole};
-use workflow_tracker::WorkflowTracker;
+use workflow_tracker::{TrackerProjectView, TrackerStatus, WorkflowTracker};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -516,6 +516,29 @@ fn get_workflow_handoff_target(
     tracker.handoff_target(project)
 }
 
+#[tauri::command]
+fn get_project_workflow(
+    project: ProjectId,
+    tracker: tauri::State<'_, WorkflowTracker>,
+) -> Option<TrackerProjectView> {
+    tracker.view(project)
+}
+
+#[tauri::command]
+fn align_project_workflow(
+    project: ProjectId,
+    role: WorkflowRole,
+    status: TrackerStatus,
+    next_role: Option<WorkflowRole>,
+    app: AppHandle,
+    tracker: tauri::State<'_, WorkflowTracker>,
+    queue: tauri::State<'_, QueueRuntime>,
+) -> Result<(), String> {
+    let mutation = tracker.align(project, role, status, next_role, &queue)?;
+    queue_bridge::emit_mutation(&app, mutation);
+    Ok(())
+}
+
 fn start_workflow_tracker(app: AppHandle, tracker: WorkflowTracker, queue: QueueRuntime) {
     thread::spawn(move || loop {
         for mutation in tracker.reconcile(&queue) {
@@ -572,6 +595,8 @@ pub fn run() {
             get_queue_state,
             advance_project_workflow,
             get_workflow_handoff_target,
+            get_project_workflow,
+            align_project_workflow,
         ])
         .setup(|app| {
             setup_tray(app.handle())?;

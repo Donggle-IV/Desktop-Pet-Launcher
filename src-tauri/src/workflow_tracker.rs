@@ -38,6 +38,15 @@ pub(crate) struct ProjectCheckpoint {
     pub(crate) last_observed_sha: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TrackerProjectView {
+    pub(crate) role: WorkflowRole,
+    pub(crate) status: TrackerStatus,
+    pub(crate) label: Option<String>,
+    pub(crate) next_role: Option<WorkflowRole>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct TrackerCheckpointFile {
     #[serde(default)]
@@ -204,6 +213,77 @@ impl WorkflowTracker {
         state_for(&inner.checkpoint, project)
             .filter(|state| state.status == TrackerStatus::Completed)
             .and_then(|state| state.next_role)
+    }
+
+    pub(crate) fn view(&self, project: ProjectId) -> Option<TrackerProjectView> {
+        let inner = self.inner.lock().expect("workflow tracker lock poisoned");
+        state_for(&inner.checkpoint, project).map(|state| TrackerProjectView {
+            role: state.current_role,
+            status: state.status,
+            label: state.label.clone(),
+            next_role: state.next_role,
+        })
+    }
+
+    pub(crate) fn align(
+        &self,
+        project: ProjectId,
+        role: WorkflowRole,
+        status: TrackerStatus,
+        next_role: Option<WorkflowRole>,
+        queue: &QueueRuntime,
+    ) -> Result<QueueMutation, String> {
+        let mut inner = self.inner.lock().expect("workflow tracker lock poisoned");
+        let config = inner
+            .config
+            .clone()
+            .ok_or_else(|| "workflow tracker is unavailable".to_string())?;
+        let prior = state_for(&inner.checkpoint, project).cloned();
+        let required_next = match (role, status) {
+            (_, TrackerStatus::Running) => None,
+            (WorkflowRole::Qa | WorkflowRole::Execution, TrackerStatus::Completed) => {
+                Some(WorkflowRole::Prepare)
+            }
+            (WorkflowRole::Prepare, TrackerStatus::Completed) => {
+                Some(next_role.ok_or_else(|| {
+                    "Prepare completed alignment requires a next role".to_string()
+                })?)
+            }
+        };
+        if status == TrackerStatus::Completed
+            && role != WorkflowRole::Prepare
+            && next_role.is_some()
+            && next_role != required_next
+        {
+            return Err("completed QA and Execution always hand off to Prepare".to_string());
+        }
+        let (baseline_sha, baseline_source, observed_sha) = if status == TrackerStatus::Running {
+            let (sha, source) = capture_baseline(project, role, &config)?;
+            (Some(sha.clone()), Some(source), Some(sha))
+        } else {
+            (
+                prior.as_ref().and_then(|state| state.baseline_sha.clone()),
+                prior
+                    .as_ref()
+                    .and_then(|state| state.baseline_source.clone()),
+                prior
+                    .as_ref()
+                    .and_then(|state| state.last_observed_sha.clone()),
+            )
+        };
+        let next = ProjectCheckpoint {
+            current_role: role,
+            status,
+            label: prior.as_ref().and_then(|state| state.label.clone()),
+            next_role: required_next,
+            baseline_sha,
+            baseline_source,
+            last_artifact: prior.as_ref().and_then(|state| state.last_artifact.clone()),
+            last_observed_sha: observed_sha,
+        };
+        set_state(&mut inner.checkpoint, project, Some(next.clone()));
+        persist(&inner)?;
+        Ok(queue.restore(project, queue_input(&next)))
     }
 }
 
@@ -372,20 +452,40 @@ fn label_from_artifact(path: &str) -> Option<String> {
     .iter()
     .find_map(|suffix| body.strip_suffix(suffix))
     .unwrap_or(body);
-    let pieces = body.split('-').collect::<Vec<_>>();
-    let label = if pieces.len() > 3
-        && pieces[0].len() == 4
+    let normalized = body.replace('_', "-");
+    let pieces = normalized.split('-').collect::<Vec<_>>();
+    let start = if pieces.len() >= 3
+        && pieces[0].len() == 8
         && pieces[0].bytes().all(|byte| byte.is_ascii_digit())
-        && pieces[1].len() == 2
+        && pieces[1].len() == 6
         && pieces[1].bytes().all(|byte| byte.is_ascii_digit())
-        && pieces[2].len() == 2
-        && pieces[2].bytes().all(|byte| byte.is_ascii_digit())
     {
-        pieces[3..].join("-")
+        2
     } else {
-        body.to_string()
-    }
-    .replace('_', "-");
+        0
+    };
+    let meaningful = &pieces[start..];
+    let label = if meaningful.len() >= 2
+        && meaningful[0].starts_with('r')
+        && meaningful[0][1..].bytes().all(|byte| byte.is_ascii_digit())
+        && meaningful[1].starts_with('a')
+        && meaningful[1][1..].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        let mut parts = vec![meaningful[0].to_uppercase(), meaningful[1].to_uppercase()];
+        if meaningful.get(2).is_some_and(|part| {
+            part.starts_with('h') && part[1..].bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            parts.push(meaningful[2].to_uppercase());
+        }
+        parts.join("-")
+    } else {
+        meaningful
+            .iter()
+            .take(2)
+            .map(|part| part.to_uppercase())
+            .collect::<Vec<_>>()
+            .join("-")
+    };
     (!label.trim().is_empty()).then_some(label)
 }
 
@@ -567,8 +667,32 @@ mod tests {
     #[test]
     fn labels_strip_timestamp_and_role_suffix() {
         assert_eq!(
-            label_from_artifact("noctua/prepare/2026-10-02-R9-A16-execution-handoff.md").as_deref(),
+            label_from_artifact("noctua/prepare/20261002-124800-r9-a16-final-pre-qa-contract-completion-execution-handoff.md").as_deref(),
             Some("R9-A16")
+        );
+        assert_eq!(
+            label_from_artifact("20261001-204100-r9-a8-h01-session-binding-execution-handoff.md")
+                .as_deref(),
+            Some("R9-A8-H01")
+        );
+        assert_eq!(
+            label_from_artifact(
+                "20261002-124500-legion-proc-maps-libil2cpp-load-bias-execution-handoff.md"
+            )
+            .as_deref(),
+            Some("LEGION-PROC")
+        );
+        assert_eq!(
+            label_from_artifact("20261002-130702-committed-mapping-elf-correlation-qa-handoff.md")
+                .as_deref(),
+            Some("COMMITTED-MAPPING")
+        );
+        assert_eq!(
+            label_from_artifact(
+                "20261002-121035-host-lldb-source-correlation-execution-handoff.md"
+            )
+            .as_deref(),
+            Some("HOST-LLDB")
         );
     }
 

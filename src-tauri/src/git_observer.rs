@@ -135,12 +135,21 @@ where
         .into_iter()
         .map(|argument| argument.as_ref().to_string())
         .collect::<Vec<_>>();
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(&args)
         .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("Unable to start git: {error}"))?;
     let started = Instant::now();

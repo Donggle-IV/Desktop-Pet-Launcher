@@ -80,7 +80,7 @@ button {
 
 .queue-row {
   display: grid;
-  grid-template-columns: 48px minmax(0, 1fr);
+  grid-template-columns: 48px minmax(0, 1fr) auto;
   column-gap: 6px;
   align-content: center;
   min-width: 0;
@@ -120,6 +120,7 @@ button {
 }
 
 .queue-summary {
+  grid-column: 2 / -1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -139,7 +140,7 @@ button {
 }
 
 .queue-label {
-  grid-column: 2 / -1;
+  grid-column: 2;
   min-width: 0;
   overflow: hidden;
   color: rgba(232, 238, 233, 0.9);
@@ -150,9 +151,10 @@ button {
 }
 
 .queue-handoff {
-  grid-column: 2 / -1;
-  justify-self: start;
-  margin-top: 2px;
+  grid-column: 3;
+  grid-row: 2;
+  justify-self: end;
+  margin-top: 0;
   padding: 1px 4px;
   color: #d8f0e0;
   background: rgba(216, 240, 224, 0.1);
