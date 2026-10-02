@@ -43,6 +43,12 @@ import { getAnimationCycleDuration, usePetAnimation } from "../lib/usePetAnimati
 import { DEFAULT_PALETTE, extractPetPalette, type PetPalette } from "../lib/petPalette";
 import { QueuePanel } from "./QueuePanel";
 import {
+  completionAcknowledgementForFocus,
+  shouldConsumePendingAcknowledgement,
+  shouldClearOneCycleAcknowledgement,
+  type CompletionAcknowledgement,
+} from "../lib/completionAcknowledgement";
+import {
   EMPTY_QUEUE_PROJECTION,
   type QueueProjectCompletedEvent,
   type QueueProjection,
@@ -81,7 +87,8 @@ export function PetWindow() {
   const [dragState, setDragState] = useState<"running-left" | "running-right" | null>(null);
   const [idleVariant, setIdleVariant] = useState<AppSettings["manualState"]>("idle");
   const [queueProjection, setQueueProjection] = useState<QueueProjection>(EMPTY_QUEUE_PROJECTION);
-  const [completionAcknowledgement, setCompletionAcknowledgement] = useState<number | null>(null);
+  const [completionAcknowledgement, setCompletionAcknowledgement] =
+    useState<CompletionAcknowledgement | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatDraft, setChatDraft] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -99,6 +106,7 @@ export function PetWindow() {
   const positionSaveEnabledAtRef = useRef(0);
   const dragRef = useRef<PetDragState | null>(null);
   const queueRevisionRef = useRef(0);
+  const completionAcknowledgementTokenRef = useRef(0);
 
   const refreshPackages = useCallback(async (petFolders: string[] = []) => {
     const found = await listPetPackages(petFolders);
@@ -156,7 +164,20 @@ export function PetWindow() {
       ),
       getCurrentWindow().listen<QueueProjectCompletedEvent>("queue-project-completed", (event) => {
         if (event.payload.revision >= queueRevisionRef.current) {
-          setCompletionAcknowledgement(event.payload.revision);
+          const token = completionAcknowledgementTokenRef.current + 1;
+          completionAcknowledgementTokenRef.current = token;
+          void getCurrentWindow()
+            .isFocused()
+            .then((focused) => {
+              if (completionAcknowledgementTokenRef.current === token) {
+                setCompletionAcknowledgement(completionAcknowledgementForFocus(token, focused));
+              }
+            })
+            .catch(() => {
+              if (completionAcknowledgementTokenRef.current === token) {
+                setCompletionAcknowledgement(completionAcknowledgementForFocus(token, true));
+              }
+            });
         }
       }),
     ])
@@ -174,11 +195,46 @@ export function PetWindow() {
   }, []);
 
   useEffect(() => {
-    if (completionAcknowledgement === null) {
+    if (!isTauriRuntime()) {
+      return;
+    }
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        if (!focused) {
+          return;
+        }
+        completionAcknowledgementTokenRef.current += 1;
+        setCompletionAcknowledgement((current) =>
+          shouldConsumePendingAcknowledgement(current, focused) ? null : current,
+        );
+      })
+      .then((nextUnlisten) => {
+        if (cancelled) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (completionAcknowledgement?.mode !== "one-cycle") {
       return;
     }
     const duration = getAnimationCycleDuration("waving", settings.animationSpeed);
-    const timer = window.setTimeout(() => setCompletionAcknowledgement(null), duration);
+    const token = completionAcknowledgement.token;
+    const timer = window.setTimeout(() => {
+      setCompletionAcknowledgement((current) =>
+        shouldClearOneCycleAcknowledgement(current, token) ? null : current,
+      );
+    }, duration);
     return () => window.clearTimeout(timer);
   }, [completionAcknowledgement, settings.animationSpeed]);
 
