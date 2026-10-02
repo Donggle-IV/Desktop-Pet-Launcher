@@ -96,6 +96,15 @@ struct TrackerInner {
     paths: Option<TrackerPaths>,
     config: Option<TrackerConfigFile>,
     checkpoint: TrackerCheckpointFile,
+    // Per-process gpt_prompt high-water marks established by startup recovery.
+    // They are deliberately not serialized into workflow-tracker.json.
+    startup_fences: StartupFences,
+}
+
+#[derive(Debug, Default)]
+struct StartupFences {
+    noctua: Option<String>,
+    fgo: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -127,12 +136,31 @@ impl WorkflowTracker {
         let mut mutations = Vec::new();
         for project in [ProjectId::Noctua, ProjectId::Fgo] {
             let persisted = state_for(&inner.checkpoint, project).cloned();
-            match startup_state_for(project, persisted.as_ref(), &config) {
+            let observed_gpt = fetch_gpt_prompt(&config);
+            let (gpt_repository, gpt_head) = match observed_gpt {
+                Ok(observed) => observed,
+                Err(error) => {
+                    eprintln!("workflow tracker startup reconciliation for {project:?} retained its state: {error}");
+                    if let Some(state) = persisted {
+                        mutations.push(queue.restore(project, queue_input(&state)));
+                    }
+                    continue;
+                }
+            };
+            match startup_state_for(
+                project,
+                persisted.as_ref(),
+                &config,
+                &gpt_repository,
+                &gpt_head,
+            ) {
                 Ok(Some(state)) => {
                     set_state(&mut inner.checkpoint, project, Some(state.clone()));
+                    set_startup_fence(&mut inner.startup_fences, project, Some(gpt_head));
                     mutations.push(queue.restore(project, queue_input(&state)));
                 }
                 Ok(None) => {
+                    set_startup_fence(&mut inner.startup_fences, project, Some(gpt_head));
                     if let Some(state) = persisted {
                         mutations.push(queue.restore(project, queue_input(&state)));
                     }
@@ -165,6 +193,12 @@ impl WorkflowTracker {
                 TrackerStatus::Running => match completion_for(project, &current, &config) {
                     Ok(Some(completed)) => {
                         set_state(&mut inner.checkpoint, project, Some(completed.clone()));
+                        if matches!(
+                            current.current_role,
+                            WorkflowRole::Prepare | WorkflowRole::Qa
+                        ) {
+                            set_startup_fence(&mut inner.startup_fences, project, None);
+                        }
                         let mutation = queue
                             .replace(project, queue_input(&completed))
                             .expect("tracker state is valid");
@@ -178,6 +212,7 @@ impl WorkflowTracker {
                 TrackerStatus::Completed => match refresh_pending_completed(project, &current, &config) {
                     Ok(Some(refreshed)) => {
                         set_state(&mut inner.checkpoint, project, Some(refreshed.clone()));
+                        set_startup_fence(&mut inner.startup_fences, project, None);
                         mutations.push(queue.restore(project, queue_input(&refreshed)));
                     }
                     Ok(None) => {}
@@ -214,8 +249,9 @@ impl WorkflowTracker {
         let next_role = previous
             .next_role
             .ok_or_else(|| "completed workflow has no next role".to_string())?;
-        let (baseline_sha, baseline_source) =
-            transition_baseline(project, next_role, &previous, &config)?;
+        let fence = startup_fence_for(&inner.startup_fences, project).cloned();
+        let (baseline_sha, baseline_source, consumed_fence) =
+            transition_baseline(project, next_role, &previous, &config, fence.as_deref())?;
         let next = ProjectCheckpoint {
             current_role: next_role,
             status: TrackerStatus::Running,
@@ -229,6 +265,9 @@ impl WorkflowTracker {
             manual_completed_at: None,
         };
         set_state(&mut inner.checkpoint, project, Some(next.clone()));
+        if consumed_fence {
+            set_startup_fence(&mut inner.startup_fences, project, None);
+        }
         persist(&inner)?;
         queue.replace(project, queue_input(&next))
     }
@@ -311,6 +350,7 @@ impl WorkflowTracker {
             manual_completed_at: None,
         };
         set_state(&mut inner.checkpoint, project, Some(next.clone()));
+        set_startup_fence(&mut inner.startup_fences, project, None);
         persist(&inner)?;
         Ok(queue.restore(project, queue_input(&next)))
     }
@@ -384,13 +424,20 @@ fn startup_state_for(
     project: ProjectId,
     persisted: Option<&ProjectCheckpoint>,
     config: &TrackerConfigFile,
+    gpt_prompt: &GitRepository,
+    gpt_head: &str,
 ) -> Result<Option<ProjectCheckpoint>, String> {
     match persisted {
-        None => latest_completed_state(project, config),
+        None => latest_completed_state(project, config, gpt_prompt),
         Some(state) if state.status == TrackerStatus::Running => {
-            Ok(completion_for(project, state, config)?.or_else(|| Some(state.clone())))
+            let completed = if state.current_role == WorkflowRole::Execution {
+                completion_for(project, state, config)?
+            } else {
+                completion_for_at_gpt_head(project, state, config, gpt_prompt, gpt_head)?
+            };
+            Ok(completed.or_else(|| Some(state.clone())))
         }
-        Some(state) => reconcile_completed_startup(project, state, config),
+        Some(state) => reconcile_completed_startup(project, state, config, gpt_prompt),
     }
 }
 
@@ -398,9 +445,10 @@ fn reconcile_completed_startup(
     project: ProjectId,
     persisted: &ProjectCheckpoint,
     config: &TrackerConfigFile,
+    gpt_prompt: &GitRepository,
 ) -> Result<Option<ProjectCheckpoint>, String> {
-    let persisted_timestamp = completed_timestamp(project, persisted, config)?;
-    let Some(current) = latest_completed_evidence(project, config)? else {
+    let persisted_timestamp = completed_timestamp(project, persisted, config, gpt_prompt)?;
+    let Some(current) = latest_completed_evidence(project, config, gpt_prompt)? else {
         eprintln!("workflow tracker startup reconciliation for {project:?} found ambiguous completion evidence");
         return Ok(Some(persisted.clone()));
     };
@@ -427,6 +475,7 @@ fn completed_timestamp(
     project: ProjectId,
     state: &ProjectCheckpoint,
     config: &TrackerConfigFile,
+    gpt_prompt: &GitRepository,
 ) -> Result<u64, String> {
     match state.current_role {
         WorkflowRole::Prepare | WorkflowRole::Qa => {
@@ -434,9 +483,7 @@ fn completed_timestamp(
                 "completed gpt_prompt workflow has no artifact commit identity; use Settings alignment"
                     .to_string()
             })?;
-            let repository = gpt_prompt_repository(config)?;
-            fetch_and_head(&repository)?;
-            git_timestamp_millis(commit_timestamp(&repository, commit)?)
+            git_timestamp_millis(commit_timestamp(gpt_prompt, commit)?)
         }
         WorkflowRole::Execution => {
             if let Some(timestamp) = state.manual_completed_at {
@@ -456,8 +503,9 @@ fn completed_timestamp(
 fn latest_completed_state(
     project: ProjectId,
     config: &TrackerConfigFile,
+    gpt_prompt: &GitRepository,
 ) -> Result<Option<ProjectCheckpoint>, String> {
-    Ok(latest_completed_evidence(project, config)?.map(BootstrapEvidence::state))
+    Ok(latest_completed_evidence(project, config, gpt_prompt)?.map(BootstrapEvidence::state))
 }
 
 fn git_timestamp_millis(timestamp_seconds: u64) -> Result<u64, String> {
@@ -494,48 +542,62 @@ fn completion_for(
             Ok(Some(completed_execution(current, head)))
         }
         WorkflowRole::Prepare | WorkflowRole::Qa => {
-            let Some(path) = config.gpt_prompt_path.clone() else {
-                return Ok(None);
-            };
-            let repository = GitRepository {
-                path,
-                branch: "main".to_string(),
-            };
-            let head = fetch_and_head(&repository)?;
-            if !is_ancestor(&repository, baseline)? {
-                return Err("stored gpt_prompt baseline is no longer an ancestor of origin/main; use Settings alignment".to_string());
-            }
-            if head == baseline {
-                return Ok(None);
-            }
-            let (directory, suffixes) = match current.current_role {
-                WorkflowRole::Prepare => (
-                    prepare_directory(project),
-                    &[
-                        "-execution-handoff.md",
-                        "-qa-handoff.md",
-                        "-reqa-handoff.md",
-                    ] as &[_],
-                ),
-                WorkflowRole::Qa => (
-                    qa_directory(project),
-                    &["-qa-report.md", "-reqa-report.md"] as &[_],
-                ),
-                WorkflowRole::Execution => unreachable!(),
-            };
-            let Some(artifact) = newest_added_artifact(&repository, baseline, directory, suffixes)?
-            else {
-                return Ok(None);
-            };
-            let next_role = if current.current_role == WorkflowRole::Qa {
-                WorkflowRole::Prepare
-            } else {
-                next_role_from_handoff(&artifact.path)
-                    .ok_or_else(|| "unrecognized Prepare handoff suffix".to_string())?
-            };
-            Ok(Some(completed_artifact(current, artifact, next_role, head)))
+            let (repository, head) = fetch_gpt_prompt(config)?;
+            completion_for_at_gpt_head(project, current, config, &repository, &head)
         }
     }
+}
+
+fn completion_for_at_gpt_head(
+    project: ProjectId,
+    current: &ProjectCheckpoint,
+    _config: &TrackerConfigFile,
+    repository: &GitRepository,
+    head: &str,
+) -> Result<Option<ProjectCheckpoint>, String> {
+    let baseline = current
+        .baseline_sha
+        .as_deref()
+        .ok_or_else(|| "running workflow has no baseline".to_string())?;
+    if current.current_role == WorkflowRole::Execution {
+        return Err("Execution does not use gpt_prompt completion evidence".to_string());
+    }
+    if !is_ancestor(repository, baseline)? {
+        return Err("stored gpt_prompt baseline is no longer an ancestor of origin/main; use Settings alignment".to_string());
+    }
+    if head == baseline {
+        return Ok(None);
+    }
+    let (directory, suffixes) = match current.current_role {
+        WorkflowRole::Prepare => (
+            prepare_directory(project),
+            &[
+                "-execution-handoff.md",
+                "-qa-handoff.md",
+                "-reqa-handoff.md",
+            ] as &[_],
+        ),
+        WorkflowRole::Qa => (
+            qa_directory(project),
+            &["-qa-report.md", "-reqa-report.md"] as &[_],
+        ),
+        WorkflowRole::Execution => unreachable!(),
+    };
+    let Some(artifact) = newest_added_artifact(repository, baseline, directory, suffixes)? else {
+        return Ok(None);
+    };
+    let next_role = if current.current_role == WorkflowRole::Qa {
+        WorkflowRole::Prepare
+    } else {
+        next_role_from_handoff(&artifact.path)
+            .ok_or_else(|| "unrecognized Prepare handoff suffix".to_string())?
+    };
+    Ok(Some(completed_artifact(
+        current,
+        artifact,
+        next_role,
+        head.to_string(),
+    )))
 }
 
 fn completed_execution(current: &ProjectCheckpoint, head: String) -> ProjectCheckpoint {
@@ -593,11 +655,20 @@ fn transition_baseline(
     next_role: WorkflowRole,
     previous: &ProjectCheckpoint,
     config: &TrackerConfigFile,
-) -> Result<(String, String), String> {
+    startup_fence: Option<&str>,
+) -> Result<(String, String, bool), String> {
     if next_role == WorkflowRole::Execution {
-        return capture_baseline(project, next_role, config);
+        let (baseline, source) = capture_baseline(project, next_role, config)?;
+        return Ok((baseline, source, false));
     }
-    let anchor = artifact_anchor_for_transition(next_role, previous)?;
+    let (anchor, consumed_fence) = gpt_transition_anchor(next_role, previous, startup_fence)?;
+    if consumed_fence {
+        let (repository, _) = fetch_gpt_prompt(config)?;
+        if !is_ancestor(&repository, &anchor)? {
+            return Err("startup gpt_prompt fence is no longer an ancestor of origin/main; use Settings alignment".to_string());
+        }
+        return Ok((anchor, "origin/main".to_string(), true));
+    }
     let repository = GitRepository {
         path: config
             .gpt_prompt_path
@@ -606,10 +677,27 @@ fn transition_baseline(
         branch: "main".to_string(),
     };
     fetch_and_head(&repository)?;
-    if !is_ancestor(&repository, anchor)? {
+    if !is_ancestor(&repository, &anchor)? {
         return Err("stored gpt_prompt artifact anchor is no longer an ancestor of origin/main; use Settings alignment".to_string());
     }
-    Ok((anchor.to_string(), "origin/main".to_string()))
+    Ok((anchor, "origin/main".to_string(), false))
+}
+
+fn gpt_transition_anchor(
+    next_role: WorkflowRole,
+    previous: &ProjectCheckpoint,
+    startup_fence: Option<&str>,
+) -> Result<(String, bool), String> {
+    if next_role == WorkflowRole::Execution {
+        return Err("Execution uses its target project remote baseline".to_string());
+    }
+    if let Some(fence) = startup_fence {
+        return Ok((fence.to_string(), true));
+    }
+    Ok((
+        artifact_anchor_for_transition(next_role, previous)?.to_string(),
+        false,
+    ))
 }
 
 fn artifact_anchor_for_transition(
@@ -665,6 +753,12 @@ fn gpt_prompt_repository(config: &TrackerConfigFile) -> Result<GitRepository, St
             .ok_or_else(|| "gpt_prompt checkout is not configured".to_string())?,
         branch: "main".to_string(),
     })
+}
+
+fn fetch_gpt_prompt(config: &TrackerConfigFile) -> Result<(GitRepository, String), String> {
+    let repository = gpt_prompt_repository(config)?;
+    let head = fetch_and_head(&repository)?;
+    Ok((repository, head))
 }
 
 fn prepare_directory(project: ProjectId) -> &'static str {
@@ -771,6 +865,20 @@ fn set_state(
     }
 }
 
+fn startup_fence_for(fences: &StartupFences, project: ProjectId) -> Option<&String> {
+    match project {
+        ProjectId::Noctua => fences.noctua.as_ref(),
+        ProjectId::Fgo => fences.fgo.as_ref(),
+    }
+}
+
+fn set_startup_fence(fences: &mut StartupFences, project: ProjectId, fence: Option<String>) {
+    match project {
+        ProjectId::Noctua => fences.noctua = fence,
+        ProjectId::Fgo => fences.fgo = fence,
+    }
+}
+
 fn load_or_create_config(path: &Path) -> Result<TrackerConfigFile, String> {
     if path.exists() {
         return read_json(path);
@@ -844,12 +952,11 @@ impl BootstrapEvidence {
 fn latest_completed_evidence(
     project: ProjectId,
     config: &TrackerConfigFile,
+    gpt_prompt: &GitRepository,
 ) -> Result<Option<BootstrapEvidence>, String> {
-    let gpt_prompt = gpt_prompt_repository(config)?;
-    fetch_and_head(&gpt_prompt)?;
     let target = project_repository(project, config);
     let prepare = newest_current_artifact(
-        &gpt_prompt,
+        gpt_prompt,
         prepare_directory(project),
         &[
             "-execution-handoff.md",
@@ -858,7 +965,7 @@ fn latest_completed_evidence(
         ],
     )?;
     let qa = newest_current_artifact(
-        &gpt_prompt,
+        gpt_prompt,
         qa_directory(project),
         &["-qa-report.md", "-reqa-report.md"],
     )?;
@@ -870,7 +977,7 @@ fn latest_completed_evidence(
                 next_role,
                 evidence_sha: artifact.commit.clone(),
                 evidence_timestamp: git_timestamp_millis(commit_timestamp(
-                    &gpt_prompt,
+                    gpt_prompt,
                     &artifact.commit,
                 )?)?,
                 artifact: Some(artifact),
@@ -883,7 +990,7 @@ fn latest_completed_evidence(
             next_role: WorkflowRole::Prepare,
             evidence_sha: artifact.commit.clone(),
             evidence_timestamp: git_timestamp_millis(commit_timestamp(
-                &gpt_prompt,
+                gpt_prompt,
                 &artifact.commit,
             )?)?,
             artifact: Some(artifact),
@@ -1317,6 +1424,50 @@ mod tests {
             .is_none());
         assert_eq!(q2.next_role, Some(WorkflowRole::Prepare));
         assert_eq!(q2.last_artifact_commit.as_deref(), Some("Q2"));
+    }
+
+    #[test]
+    fn startup_fence_prevents_history_replay_then_returns_to_artifact_anchors() {
+        let historical_execution = completed_execution(
+            &completed_artifact(
+                &running(WorkflowRole::Prepare),
+                artifact("noctua/prepare/p1-execution-handoff.md", "P1"),
+                WorkflowRole::Execution,
+                "P1".to_string(),
+            ),
+            "E1".to_string(),
+        );
+        let (fenced_prepare, consumed) =
+            gpt_transition_anchor(WorkflowRole::Prepare, &historical_execution, Some("S1"))
+                .unwrap();
+        assert_eq!(fenced_prepare, "S1");
+        assert!(consumed);
+
+        let fresh_prepare = completed_artifact(
+            &running(WorkflowRole::Prepare),
+            artifact("noctua/prepare/p3-qa-handoff.md", "P3"),
+            WorkflowRole::Qa,
+            "P3".to_string(),
+        );
+        let (qa_baseline, consumed) =
+            gpt_transition_anchor(WorkflowRole::Qa, &fresh_prepare, None).unwrap();
+        assert_eq!(qa_baseline, "P3");
+        assert!(!consumed);
+    }
+
+    #[test]
+    fn startup_fences_are_project_independent_and_not_checkpoint_data() {
+        let mut fences = StartupFences::default();
+        set_startup_fence(&mut fences, ProjectId::Noctua, Some("S-N".to_string()));
+        set_startup_fence(&mut fences, ProjectId::Fgo, Some("S-F".to_string()));
+        set_startup_fence(&mut fences, ProjectId::Noctua, None);
+        assert_eq!(startup_fence_for(&fences, ProjectId::Noctua), None);
+        assert_eq!(
+            startup_fence_for(&fences, ProjectId::Fgo).map(String::as_str),
+            Some("S-F")
+        );
+        let serialized = serde_json::to_string(&TrackerCheckpointFile::default()).unwrap();
+        assert!(!serialized.contains("startupFence"));
     }
 
     #[test]
